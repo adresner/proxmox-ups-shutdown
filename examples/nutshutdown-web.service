@@ -1,0 +1,18 @@
+[Unit]
+Description=nutshutdown web UI (UPS shutdown orchestrator)
+After=network-online.target nut-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/nutshutdown
+Environment=HOME=/root
+ExecStart=/usr/bin/python3 /opt/nutshutdown/webapp.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

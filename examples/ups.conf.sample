@@ -1,0 +1,15 @@
+# /etc/nut/ups.conf — example
+#
+# Replace <NMC_IP> with the IP address of your UPS's network management card
+# and <SNMP_COMMUNITY> with its SNMP read community (factory default: public).
+# The section name (here: "ups-main") must match `ups_name` in config.json.
+
+maxretry = 3
+
+[ups-main]
+    driver = snmp-ups
+    port = <NMC_IP>
+    community = <SNMP_COMMUNITY>
+    snmp_version = v1
+    desc = "Main UPS"
+    pollfreq = 15

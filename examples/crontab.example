@@ -1,0 +1,4 @@
+# Install with `crontab -e` (as root). Runs the worker every minute.
+# Set DRY_RUN=1 to test without ever issuing real SSH/shutdown commands.
+
+* * * * * /usr/bin/python3 /opt/nutshutdown/power_monitor.py

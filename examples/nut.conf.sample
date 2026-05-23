@@ -1,0 +1,6 @@
+# /etc/nut/nut.conf — example
+#
+# netserver = run as a NUT server so other machines on the LAN (or just this
+# host's own `upsc`) can query the UPS.
+
+MODE=netserver

@@ -1,0 +1,24 @@
+# Runtime / local configuration — never commit
+config.json
+*.log
+power_state
+
+# Secrets and per-host state
+.ssh/
+id_rsa
+id_rsa.pub
+
+# Editor / tooling
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+*.swp
+*.tmp
+
+# Personal notes / AI tooling
+.claude/
+.claude.json
+.bash_history
+NOTES.local.md

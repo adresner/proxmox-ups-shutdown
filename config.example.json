@@ -1,0 +1,33 @@
+{
+  "_comment": "Copy to config.json and edit. Hosts list can be empty to start; add via web UI or `./manage.py add`.",
+
+  "ups_name": "ups-main",
+
+  "thresholds": {
+    "vm_shutdown_pct": 60,
+    "host_shutdown_pct": 20
+  },
+
+  "ssh": {
+    "user": "root",
+    "connect_timeout": 5,
+    "key_path": "/root/.ssh/id_rsa"
+  },
+
+  "hosts": [
+    { "ip": "10.0.0.21", "label": "pve-01", "enabled": true,  "note": "example - replace with your hosts" },
+    { "ip": "10.0.0.22", "label": "pve-02", "enabled": false, "note": "example - disabled" }
+  ],
+
+  "paths": {
+    "state_file": "/var/run/power_state",
+    "log_file":   "/var/log/power_monitor.log"
+  },
+
+  "web": {
+    "bind": "0.0.0.0",
+    "port": 8080,
+    "username": "admin",
+    "password": "CHANGE_ME_BEFORE_STARTING"
+  }
+}

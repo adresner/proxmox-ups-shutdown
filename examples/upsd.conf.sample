@@ -1,0 +1,8 @@
+# /etc/nut/upsd.conf — example
+#
+# Listen on localhost plus the LXC's LAN address so `upsc` and any other
+# NUT clients on your LAN can reach upsd. Adjust the LAN IP to match your
+# orchestrator host.
+
+LISTEN 127.0.0.1 3493
+LISTEN <THIS_HOST_LAN_IP> 3493
