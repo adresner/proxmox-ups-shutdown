@@ -46,12 +46,57 @@ Re-running `install.sh` upgrades the code in-place and never touches your
   UPS that NUT's `snmp-ups` driver supports should work.
 - **One always-on host on the same LAN as the UPS** to run the orchestrator.
   In our setup it's a 256MB Debian 12 LXC on Proxmox, but a small VM, a
-  Raspberry Pi, or any Debian/Ubuntu box will do.
+  Raspberry Pi, or any Debian/Ubuntu box will do. **See [Topology](#topology)
+  below — this should *not* be one of the Proxmox hosts you intend to shut
+  down.**
 - **One or more Proxmox VE hosts** to shut down. They need to be reachable
   over SSH from the orchestrator, with key-based root login (the UI helps you
   set that up).
 - Python 3.9+, Flask, NUT 2.8+, `sshpass`. Apt packages: `nut nut-snmp
   python3-flask sshpass openssh-client`.
+
+## Topology
+
+**Don't run the orchestrator on a Proxmox host that's in its own shutdown
+list.** If you did, the worker would issue a `shutdown -h now` to itself
+mid-job and stop running before it could finish bringing the rest of the
+fleet down.
+
+The recommended pattern is a small "utility" machine that's separate from
+your workload servers — a micro PC, an Intel NUC, a Raspberry Pi, or a
+low-power Proxmox host dedicated to monitoring and orchestrators. The
+workload (the servers you actually care about) lives on bigger boxes, and
+*those* are what go in nutshutdown's host table.
+
+A typical setup looks like this:
+
+```
+   ┌─────────────────────────────────────────────────────────────┐
+   │  UPS (network-managed, e.g. APC Smart-UPS + AP9641 NMC)     │
+   └────────────────────────────┬────────────────────────────────┘
+                                │ SNMP
+                                ▼
+   ┌──────────────────────────────────────┐    ┌───────────────────────┐
+   │  Small utility host (this stays up)  │    │  Workload Proxmox #1  │
+   │   ├─ Proxmox VE (or plain Debian)    │    │   - VMs / LXCs that   │
+   │   └─ nutshutdown LXC (the orchestr.) │───▶│     hold real work    │
+   └──────────────────────────────────────┘ssh └───────────────────────┘
+                          │
+                          │ssh                  ┌───────────────────────┐
+                          └────────────────────▶│  Workload Proxmox #2  │
+                                                └───────────────────────┘
+```
+
+In the author's setup the "utility host" is a fanless micro PC running
+Proxmox with a handful of small LXCs (this orchestrator, plus other monitoring
+bits). The workload sits on a Dell and a Supermicro server — those two are
+the only entries in nutshutdown's host table, and they're what the worker
+gracefully powers down on a long outage.
+
+The utility host itself is not covered by nutshutdown's graceful shutdown —
+the UPS will eventually cut its power when the battery runs out, and that's
+fine. The orchestrator's whole job is to make sure the *important* boxes
+are already down well before then.
 
 ## How it works
 
