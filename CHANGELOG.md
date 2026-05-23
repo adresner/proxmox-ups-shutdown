@@ -41,6 +41,12 @@ SRT 5000 with an AP9641 network management card and a small Proxmox VE cluster.
   samples in `examples/`.
 - Documentation: README, this CHANGELOG, MIT LICENSE.
 
+### Documentation
+
+- "Topology" section in the README explaining that the orchestrator should
+  not be installed on a host that's also in its own shutdown list, with the
+  recommended "small utility host alongside the workload hosts" pattern.
+
 ### Known limitations
 
 - One UPS, one NUT section.
