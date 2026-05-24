@@ -1,4 +1,4 @@
-# nutshutdown
+# proxmox-ups-shutdown
 
 **UPS-triggered graceful shutdown for a Proxmox cluster, driven from a web UI.**
 
@@ -15,9 +15,6 @@ touching anything live.
 
 ![Screenshot](docs/screenshot.png)
 
-> *(Replace `docs/screenshot.png` with a screenshot of your running web UI
-> after install — see "Adding a screenshot" at the bottom.)*
-
 > **No real-shutdown buttons in the UI on purpose.** Real shutdowns only fire
 > from the cron worker reacting to actual UPS state. The UI exposes config
 > edits, SSH connectivity tests, and a "simulate" button that prints what
@@ -26,8 +23,8 @@ touching anything live.
 ## TL;DR install (Debian / Ubuntu / Proxmox LXC)
 
 ```sh
-git clone https://github.com/<you>/nutshutdown.git
-cd nutshutdown
+git clone https://github.com/adresner/proxmox-ups-shutdown.git
+cd proxmox-ups-shutdown
 sudo ./install.sh
 ```
 
