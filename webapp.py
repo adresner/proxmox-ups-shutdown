@@ -257,6 +257,9 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
 .bar.low > div{background:var(--warn)}
 .bar.crit > div{background:var(--bad)}
 .foot{padding:8px 24px;color:var(--muted);font-size:12px}
+.editable{cursor:pointer;padding:2px 4px;border-radius:3px;border:1px dashed transparent;display:inline-block;min-width:80px}
+.editable:hover{background:#0a0c10;border-color:var(--line)}
+.placeholder{color:var(--muted);font-style:italic;font-size:12px}
 </style></head><body>
 <header>
   <h1>nutserver — Proxmox graceful-shutdown orchestrator</h1>
@@ -394,6 +397,38 @@ async function api(path, opts){
   if(!r.ok && r.status===401){ throw new Error("auth required"); }
   return r.json();
 }
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+}
+async function editCell(el, ip, field){
+  const original = el.textContent === "click to set label" || el.textContent === "click to add note"
+                   ? "" : el.textContent;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = original;
+  input.style.cssText = "width:100%;background:#0c0e13;border:1px solid var(--accent);border-radius:4px;padding:4px 6px;color:var(--ink);font:inherit";
+  el.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const save = async () => {
+    if(done) return;
+    done = true;
+    const newVal = input.value.trim();
+    if(newVal === original){ refresh(); return; }
+    const r = await fetch("/api/host/"+ip, {method:"PATCH",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({[field]: newVal})});
+    if(!r.ok){ alert("edit failed: "+r.status+" "+await r.text()); }
+    refresh();
+  };
+  input.addEventListener("blur", save);
+  input.addEventListener("keydown", e => {
+    if(e.key === "Enter"){ e.preventDefault(); save(); }
+    if(e.key === "Escape"){ done = true; refresh(); }
+  });
+}
 function fmtRuntime(s){
   if(!s) return "—";
   const m = Math.floor(s/60), ss = s%60;
@@ -429,15 +464,18 @@ async function refresh(){
   tbody.innerHTML = "";
   for(const h of s.hosts){
     const tr = document.createElement("tr");
+    const ip = esc(h.ip);
+    const label = esc(h.label||"");
+    const note = esc(h.note||"");
     tr.innerHTML = `
-      <td><input type="checkbox" ${h.enabled?"checked":""} onchange="toggle('${h.ip}', this.checked)"></td>
-      <td><code>${h.ip}</code></td>
-      <td>${h.label||""}</td>
-      <td class="muted">${h.note||""}</td>
+      <td><input type="checkbox" ${h.enabled?"checked":""} onchange="toggle('${ip}', this.checked)"></td>
+      <td><code>${ip}</code></td>
+      <td><span class="editable" title="click to edit" onclick="editCell(this,'${ip}','label')">${label||"<span class='placeholder'>click to set label</span>"}</span></td>
+      <td><span class="editable muted" title="click to edit" onclick="editCell(this,'${ip}','note')">${note||"<span class='placeholder'>click to add note</span>"}</span></td>
       <td class="row-actions">
-        <button class="ghost" onclick="testOne('${h.ip}')">Test SSH</button>
-        <button class="ghost" onclick="pushKey('${h.ip}','${h.label||h.ip}')">Push key</button>
-        <button class="danger" onclick="removeHost('${h.ip}')">Remove</button>
+        <button class="ghost" onclick="testOne('${ip}')">Test SSH</button>
+        <button class="ghost" onclick="pushKey('${ip}','${label||ip}')">Push key</button>
+        <button class="danger" onclick="removeHost('${ip}')">Remove</button>
       </td>`;
     tbody.appendChild(tr);
   }
