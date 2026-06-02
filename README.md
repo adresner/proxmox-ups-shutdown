@@ -293,11 +293,14 @@ Everything the web UI does is also available via `manage.py`:
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| GET    | `/api/status` | no | UPS + state + hosts + log tail |
-| GET    | `/api/ups/config` | no | Current `ups.conf` section keys + `ups_name` |
+| GET    | `/login` | no  | HTML login form |
+| POST   | `/login` | no  | Validate `web.username` + `web.password`, set session cookie |
+| GET\|POST | `/logout` | yes | Clear session, redirect to `/login` |
+| GET    | `/api/status` | yes | UPS + state + hosts + log tail |
+| GET    | `/api/ups/config` | yes | Current `ups.conf` section keys + `ups_name` |
 | POST   | `/api/ups/config` | yes | `{name, host, community, pollfreq}` — write, restart NUT, verify, auto-rollback |
-| POST   | `/api/simulate` | no | `{charge, on_battery}` — pure dry-run |
-| POST   | `/api/test-ssh` | no | `{ip}` or empty for all |
+| POST   | `/api/simulate` | yes | `{charge, on_battery}` — pure dry-run |
+| POST   | `/api/test-ssh` | yes | `{ip}` or empty for all |
 | POST   | `/api/host/<ip>/push-key` | yes | `{password}` — `sshpass + ssh-copy-id`; password via env var, never logged |
 | POST   | `/api/host` | yes | Add: `{ip, label, note, enabled}` |
 | PATCH  | `/api/host/<ip>` | yes | `{enabled, label, note}` |
@@ -305,8 +308,14 @@ Everything the web UI does is also available via `manage.py`:
 | POST   | `/api/thresholds` | yes | `{vm_shutdown_pct, host_shutdown_pct}` |
 | POST   | `/api/state/reset` | yes | Force state → `NORMAL` |
 
-Mutating endpoints use HTTP Basic Auth against `web.username` / `web.password`
-in `config.json`.
+**Authentication.** The browser uses a session cookie obtained via the
+`/login` form (Flask-signed, HttpOnly, SameSite=Lax, 30-day lifetime). The
+signing key auto-generates on first run at `.session_secret` next to
+`webapp.py` (mode 0600); `rm` it and restart the service to invalidate every
+existing session. Scripts and `curl` can also use HTTP Basic Auth against the
+API endpoints with the same `web.username` / `web.password` from
+`config.json` — both auth methods are accepted on the API; only the browser
+flow uses sessions.
 
 ## Tuning
 
