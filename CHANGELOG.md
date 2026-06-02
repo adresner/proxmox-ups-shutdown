@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] — Inline-editable host labels and notes
+
+### Added
+
+- **Click-to-edit on Label and Note columns** in the hosts table. Click the
+  text → it becomes an input → press Enter or click away to save → Escape
+  cancels. Empty cells show a faint "click to set label" / "click to add
+  note" hint so the affordance is obvious. The PATCH backend already
+  supported these fields; this just exposes them in the UI.
+
+### Fixed
+
+- **XSS hardening on the hosts table.** Host IP/label/note values are now
+  HTML-escaped before being inlined into the table row template, so a
+  label like `<script>` won't execute. (Previously the values came from
+  config.json which is owner-written, so this was theoretical rather than
+  exploitable — but worth fixing anyway.)
+
 ## [0.1.1] — Auth fix
 
 ### Fixed
