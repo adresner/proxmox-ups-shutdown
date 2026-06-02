@@ -11,11 +11,26 @@ when the UPS itself reports a real outage.
 from __future__ import annotations
 
 import functools
-from flask import Flask, jsonify, request, render_template_string, Response
+import os
+from datetime import timedelta
+from pathlib import Path
+from flask import (
+    Flask, jsonify, request, render_template_string, Response,
+    session, redirect, url_for,
+)
 
 import pmlib
 
 app = Flask(__name__)
+
+# Sign session cookies with a key kept in a 0600 file next to webapp.py.
+# Auto-generated on first run; survives restarts so users stay logged in.
+_KEY_PATH = Path(__file__).parent / ".session_secret"
+if not _KEY_PATH.exists():
+    _KEY_PATH.write_bytes(os.urandom(32))
+    os.chmod(_KEY_PATH, 0o600)
+app.secret_key = _KEY_PATH.read_bytes()
+app.permanent_session_lifetime = timedelta(days=30)
 
 
 # --- Auth ------------------------------------------------------------------
@@ -26,17 +41,57 @@ def _check_auth(username, password) -> bool:
     return username == web.get("username") and password == web.get("password")
 
 
+def _is_logged_in() -> bool:
+    """True if the request carries a valid session cookie or Basic Auth.
+
+    Sessions are the browser path. Basic Auth is preserved as a fallback so
+    curl/scripts still work without going through the login form.
+    """
+    if session.get("user"):
+        return True
+    auth = request.authorization
+    if auth and _check_auth(auth.username, auth.password):
+        return True
+    return False
+
+
 def requires_auth(view):
+    """Require auth. API routes return JSON 401; pages redirect to /login."""
     @functools.wraps(view)
     def wrapper(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not _check_auth(auth.username, auth.password):
-            return Response(
-                "Login required.", 401,
-                {"WWW-Authenticate": 'Basic realm="nutserver"'},
-            )
-        return view(*args, **kwargs)
+        if _is_logged_in():
+            return view(*args, **kwargs)
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "not authenticated"}), 401
+        return redirect(url_for("login", next=request.path))
     return wrapper
+
+
+# --- Login / logout --------------------------------------------------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        if _check_auth(username, password):
+            session.permanent = True
+            session["user"] = username
+            dest = request.args.get("next") or "/"
+            if not dest.startswith("/") or dest.startswith("//"):
+                dest = "/"
+            return redirect(dest)
+        error = "Invalid username or password."
+    if _is_logged_in() and request.method == "GET":
+        return redirect("/")
+    return render_template_string(LOGIN_PAGE, error=error)
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # --- Read endpoints --------------------------------------------------------
@@ -48,6 +103,7 @@ def index():
 
 
 @app.route("/api/status")
+@requires_auth
 def api_status():
     cfg = pmlib.load_config()
     try:
@@ -74,6 +130,7 @@ def api_status():
 
 
 @app.route("/api/simulate", methods=["POST"])
+@requires_auth
 def api_simulate():
     cfg = pmlib.load_config()
     data = request.get_json(force=True, silent=True) or {}
@@ -92,6 +149,7 @@ def api_simulate():
 
 
 @app.route("/api/ups/config", methods=["GET"])
+@requires_auth
 def api_ups_config_get():
     cfg = pmlib.load_config()
     return jsonify(pmlib.get_ups_config(cfg))
@@ -128,6 +186,7 @@ def api_push_key(ip):
 
 
 @app.route("/api/test-ssh", methods=["POST"])
+@requires_auth
 def api_test_ssh():
     cfg = pmlib.load_config()
     data = request.get_json(force=True, silent=True) or {}
@@ -267,6 +326,9 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
   <span id="state-pill" class="pill warn">…</span>
   <span style="flex:1"></span>
   <button class="ghost" onclick="refresh()">Refresh</button>
+  <form method="POST" action="/logout" style="margin:0">
+    <button class="ghost" type="submit">Log out</button>
+  </form>
 </header>
 
 <div class="grid">
@@ -394,7 +456,8 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
 <script>
 async function api(path, opts){
   const r = await fetch(path, opts);
-  if(!r.ok && r.status===401){ throw new Error("auth required"); }
+  if(r.status === 401){ window.location = "/login"; throw new Error("auth required"); }
+  if(!r.ok){ throw new Error("HTTP " + r.status); }
   return r.json();
 }
 function esc(s){
@@ -658,6 +721,41 @@ async function testAllSsh(){
 refresh();
 setInterval(refresh, 15000);
 </script>
+</body></html>
+"""
+
+
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>nutshutdown — log in</title>
+<style>
+:root{--bg:#0f1115;--panel:#181b22;--ink:#e6e8ec;--muted:#8a93a6;
+      --accent:#6aa9ff;--bad:#ef5d5d;--line:#262a33;}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,Segoe UI,Inter,sans-serif;background:var(--bg);color:var(--ink);
+     display:flex;align-items:center;justify-content:center;min-height:100vh}
+form{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px;min-width:320px;max-width:380px}
+h1{margin:0 0 4px;font-size:18px;font-weight:600}
+.sub{color:var(--muted);font-size:13px;margin:0 0 18px}
+label{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:10px 0 4px}
+input{width:100%;background:#0c0e13;border:1px solid var(--line);border-radius:5px;
+      padding:9px 10px;color:var(--ink);font:inherit}
+input:focus{outline:0;border-color:var(--accent)}
+button{margin-top:18px;background:var(--accent);color:#03142e;border:0;border-radius:5px;
+       padding:10px 12px;cursor:pointer;font-weight:600;width:100%;font:inherit}
+.err{color:var(--bad);font-size:12px;margin:10px 0 0;min-height:1em}
+.foot{color:var(--muted);font-size:11px;margin-top:14px;text-align:center}
+</style></head><body>
+<form method="POST" action="/login{% if request.args.get('next') %}?next={{ request.args.get('next') }}{% endif %}">
+  <h1>nutshutdown</h1>
+  <p class="sub">UPS-triggered graceful shutdown orchestrator</p>
+  <label for="username">Username</label>
+  <input id="username" name="username" autocomplete="username" autofocus>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password">
+  <button type="submit">Log in</button>
+  <div class="err">{% if error %}{{ error }}{% endif %}</div>
+  <div class="foot">credentials live in <code>config.json</code> → <code>web.*</code></div>
+</form>
 </body></html>
 """
 

@@ -4,6 +4,36 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — Session-based login form (replaces HTTP Basic Auth)
+
+### Changed
+
+- **Replaced HTTP Basic Auth with a real login form** at `/login`. The browser
+  Basic Auth dialog was unreliable: it wouldn't appear after a previously
+  canceled dialog, stayed wedged in Chrome's HTTP auth cache even after
+  clearing site data, and required quitting the entire browser to clear stale
+  credentials after a password rotation.
+- Sessions are signed cookies (Flask's built-in session, HttpOnly, SameSite=Lax,
+  30-day lifetime). The signing key is auto-generated on first run and stored
+  in `.session_secret` next to `webapp.py` (mode 0600).
+- A "Log out" button is in the dashboard header.
+
+### Added
+
+- `GET /login` — login form page.
+- `POST /login` — validates credentials against `config.json`'s `web.username`
+  + `web.password`, sets a session cookie, redirects to the `next` URL (or `/`).
+- `GET|POST /logout` — clears the session, redirects to `/login`.
+
+### Kept
+
+- **HTTP Basic Auth still works on API endpoints** as a fallback for
+  curl/scripts/cron, so existing automation doesn't break — only the browser
+  flow uses sessions.
+- All previously-public read endpoints (`/api/status`, `/api/simulate`,
+  `/api/test-ssh`, `GET /api/ups/config`) now also require auth, for
+  consistency now that the dashboard always requires login.
+
 ## [0.1.2] — Inline-editable host labels and notes
 
 ### Added
