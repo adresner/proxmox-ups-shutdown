@@ -10,11 +10,16 @@ import json
 import logging
 import os
 import re
+import smtplib
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+
+EVENT_NAMES = ("warning", "guests_shutdown", "hosts_shutdown", "power_restored")
 
 CONFIG_PATH = Path("/root/config.json")
 NUT_UPS_CONF = Path("/etc/nut/ups.conf")
@@ -98,17 +103,57 @@ GUESTS_DOWN = "GUESTS_DOWN"
 HOSTS_DOWN = "HOSTS_DOWN"
 
 
-def read_state(cfg: dict) -> str:
+def _read_state_blob(cfg: dict) -> dict:
+    """Return {'state': str, 'sent': list} from disk.
+
+    Accepts the legacy plain-text format ("NORMAL"/"GUESTS_DOWN"/"HOSTS_DOWN")
+    and wraps it into the new dict form on first read.
+    """
     path = Path(cfg["paths"]["state_file"])
     try:
-        return path.read_text().strip() or NORMAL
+        text = path.read_text().strip()
     except FileNotFoundError:
-        return NORMAL
+        return {"state": NORMAL, "sent": []}
+    if not text:
+        return {"state": NORMAL, "sent": []}
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "state" in data:
+            data.setdefault("sent", [])
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return {"state": text, "sent": []}
+
+
+def _write_state_blob(cfg: dict, data: dict) -> None:
+    path = Path(cfg["paths"]["state_file"])
+    path.write_text(json.dumps(data))
+
+
+def read_state(cfg: dict) -> str:
+    return _read_state_blob(cfg)["state"]
 
 
 def write_state(cfg: dict, value: str) -> None:
-    path = Path(cfg["paths"]["state_file"])
-    path.write_text(value)
+    """Update state value; clear the 'sent' notification list when returning to NORMAL."""
+    data = _read_state_blob(cfg)
+    data["state"] = value
+    if value == NORMAL:
+        data["sent"] = []
+    _write_state_blob(cfg, data)
+
+
+def has_notified(cfg: dict, event: str) -> bool:
+    return event in _read_state_blob(cfg).get("sent", [])
+
+
+def mark_notified(cfg: dict, event: str) -> None:
+    data = _read_state_blob(cfg)
+    sent = data.setdefault("sent", [])
+    if event not in sent:
+        sent.append(event)
+    _write_state_blob(cfg, data)
 
 
 # --- SSH / shutdown --------------------------------------------------------
@@ -483,6 +528,159 @@ def update_ups_config(cfg: dict, new: dict) -> tuple[bool, str]:
         return True, "applied"
     except Exception as e:
         return rollback(str(e))
+
+
+# --- Notifications ---------------------------------------------------------
+
+def _parse_recipients(raw) -> list[str]:
+    if isinstance(raw, list):
+        return [a.strip() for a in raw if a and a.strip()]
+    if isinstance(raw, str):
+        return [a.strip() for a in raw.replace(";", ",").split(",") if a.strip()]
+    return []
+
+
+def send_email(cfg: dict, subject: str, body: str) -> tuple[bool, str]:
+    """Send a single email via the SMTP server configured under notifications.*.
+
+    Returns (ok, message). All values come from config; nothing is hardcoded.
+    """
+    notif = cfg.get("notifications", {})
+    host = (notif.get("smtp_host") or "").strip()
+    if not host:
+        return False, "smtp_host not configured"
+    sender = (notif.get("from_address") or "").strip()
+    if not sender:
+        return False, "from_address not configured"
+    recipients = _parse_recipients(notif.get("to_addresses"))
+    if not recipients:
+        return False, "to_addresses not configured"
+
+    port = int(notif.get("smtp_port") or 25)
+    use_tls = bool(notif.get("smtp_use_tls"))
+    user = (notif.get("smtp_user") or "").strip()
+    password = notif.get("smtp_password") or ""
+
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        if use_tls and port == 465:
+            client = smtplib.SMTP_SSL(host, port, timeout=15)
+        else:
+            client = smtplib.SMTP(host, port, timeout=15)
+            if use_tls:
+                client.starttls()
+        try:
+            if user:
+                client.login(user, password)
+            client.send_message(msg)
+        finally:
+            try: client.quit()
+            except Exception: pass
+        return True, f"sent to {', '.join(recipients)}"
+    except smtplib.SMTPAuthenticationError as e:
+        return False, f"auth failed: {e}"
+    except (smtplib.SMTPException, OSError) as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _format_event_email(cfg: dict, event: str, ups: dict) -> tuple[str, str]:
+    """Return (subject, body) for a given event using current UPS data."""
+    charge = ups.get("_charge", "?")
+    runtime_s = ups.get("_runtime_s", 0)
+    runtime_str = f"{runtime_s // 60}m {runtime_s % 60}s" if runtime_s else "unknown"
+    model = ups.get("device.model", cfg.get("ups_name", "UPS"))
+    hostname = socket.gethostname()
+    enabled = enabled_hosts(cfg)
+    host_list = ", ".join(f"{h.label} ({h.ip})" for h in enabled) or "(none enabled)"
+    th = cfg["thresholds"]
+
+    if event == "warning":
+        subject = f"[nutshutdown] UPS battery warning — {charge}%"
+        body = (f"The UPS reports it is on battery and the charge has dropped "
+                f"to {charge}%.\n\nRuntime estimate: {runtime_str}\n"
+                f"Next stage: guest shutdown at {th['vm_shutdown_pct']}% "
+                f"(then host shutdown at {th['host_shutdown_pct']}%).\n\n"
+                f"UPS: {model}\nEnabled hosts: {host_list}\n"
+                f"Orchestrator: {hostname}\n")
+    elif event == "guests_shutdown":
+        subject = f"[nutshutdown] Guest shutdown started — battery {charge}%"
+        body = (f"Battery dropped to {charge}% (<= {th['vm_shutdown_pct']}%). "
+                f"qm shutdown and pct shutdown have been issued to every "
+                f"enabled host.\n\nRuntime estimate: {runtime_str}\n"
+                f"Hosts: {host_list}\nOrchestrator: {hostname}\n")
+    elif event == "hosts_shutdown":
+        subject = f"[nutshutdown] Host shutdown started — battery {charge}%"
+        body = (f"Battery dropped to {charge}% (<= {th['host_shutdown_pct']}%). "
+                f"shutdown -h now has been issued to every enabled host. This "
+                f"is the last email this outage.\n\nHosts: {host_list}\n"
+                f"Orchestrator: {hostname}\n")
+    elif event == "power_restored":
+        subject = "[nutshutdown] Power restored"
+        body = (f"The UPS reports it is back online (charge {charge}%). The "
+                f"state machine has been reset to NORMAL; the next outage "
+                f"will fire a fresh round of notifications.\n\n"
+                f"Hosts: {host_list}\nOrchestrator: {hostname}\n")
+    else:
+        subject = f"[nutshutdown] {event}"
+        body = f"Event: {event}\nCharge: {charge}%\nHosts: {host_list}\n"
+    return subject, body
+
+
+def notify_event(cfg: dict, event: str, ups: dict,
+                 *, dry_run: bool = False, log=None) -> tuple[bool, str]:
+    """Send the email for an event if it's enabled and hasn't fired this outage.
+
+    Marks as sent on success (so the per-minute cron doesn't re-fire).
+    Skips silently if the event is disabled or already sent.
+    """
+    notif = cfg.get("notifications", {})
+    events = notif.get("events", {})
+    if not events.get(event, False):
+        return False, "event disabled"
+    if has_notified(cfg, event):
+        return False, "already sent this outage"
+    if dry_run:
+        if log:
+            log.info(f"[DRY-RUN] would notify event={event}")
+        return True, "[DRY-RUN]"
+    subject, body = _format_event_email(cfg, event, ups)
+    ok, msg = send_email(cfg, subject, body)
+    if ok:
+        mark_notified(cfg, event)
+        if log:
+            log.info(f"email sent: event={event} ({msg})")
+    else:
+        if log:
+            log.error(f"email FAILED: event={event} — {msg}")
+    return ok, msg
+
+
+def validate_notifications_input(data: dict) -> str | None:
+    """Lightweight sanity check on the notifications form input. Returns error or None."""
+    if data.get("smtp_host") and not isinstance(data["smtp_host"], str):
+        return "smtp_host must be a string"
+    try:
+        port = int(data.get("smtp_port") or 25)
+    except (TypeError, ValueError):
+        return "smtp_port must be integer"
+    if not (1 <= port <= 65535):
+        return "smtp_port must be 1-65535"
+    try:
+        wp = int(data.get("warning_pct") or 80)
+    except (TypeError, ValueError):
+        return "warning_pct must be integer"
+    if not (1 <= wp <= 100):
+        return "warning_pct must be 1-100"
+    recipients = _parse_recipients(data.get("to_addresses"))
+    for r in recipients:
+        if "@" not in r:
+            return f"invalid recipient address: {r!r}"
+    return None
 
 
 def tail_log(cfg: dict, lines: int = 50) -> list[str]:
