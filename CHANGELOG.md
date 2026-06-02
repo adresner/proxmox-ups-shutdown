@@ -4,6 +4,43 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — Email notifications
+
+### Added
+
+- **Email alerts on UPS state transitions.** Four events, individually
+  enable/disable-able from the GUI:
+  - **Warning** — battery on UPS drops to a configurable `warning_pct`
+    (default 80%) while still above the guest-shutdown threshold.
+  - **Guest shutdown stage fired** — battery hit `vm_shutdown_pct`, the
+    worker SSH'd `qm` / `pct shutdown` to every enabled host.
+  - **Host shutdown stage fired** — battery hit `host_shutdown_pct`, the
+    worker SSH'd `shutdown -h now`.
+  - **Power restored** — UPS reports OL, state machine resetting.
+- **"Notifications" card in the dashboard** with SMTP host/port/user/password
+  (all optional), STARTTLS toggle, From, comma-separated To list, warning %,
+  and four event checkboxes. Plus a "Send test email" button so you can
+  verify SMTP before relying on it.
+- **Endpoints**: `GET /api/notifications/config`, `POST
+  /api/notifications/config`, `POST /api/notifications/test` (all
+  authenticated).
+- **`notify_event()` and supporting helpers in `pmlib.py`** — gated by the
+  per-event enable flag in config and the `sent` list in the state file, so
+  each event fires at most once per outage no matter how many times the
+  cron worker tick.
+
+### Changed
+
+- **State file format extended** from plain text to a JSON blob:
+  `{"state": "NORMAL"|"GUESTS_DOWN"|"HOSTS_DOWN", "sent": ["warning", ...]}`.
+  Legacy plain-text state files are read transparently and rewritten as JSON
+  on the next state change — no manual migration. Reset to NORMAL clears
+  the `sent` list so the next outage gets a fresh round of emails.
+- `power_monitor.py` now calls `notify_event()` at every relevant point:
+  warning crossing, guest shutdown, host shutdown, and power restored.
+- `DRY_RUN=1` for the worker also dry-runs email sends (logged but not
+  actually transmitted).
+
 ## [0.2.0] — Session-based login form (replaces HTTP Basic Auth)
 
 ### Changed

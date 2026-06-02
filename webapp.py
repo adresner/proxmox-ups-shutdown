@@ -155,6 +155,66 @@ def api_ups_config_get():
     return jsonify(pmlib.get_ups_config(cfg))
 
 
+@app.route("/api/notifications/config", methods=["GET"])
+@requires_auth
+def api_notifications_config_get():
+    cfg = pmlib.load_config()
+    n = cfg.get("notifications", {}) or {}
+    return jsonify({
+        "smtp_host": n.get("smtp_host", ""),
+        "smtp_port": n.get("smtp_port", 25),
+        "smtp_user": n.get("smtp_user", ""),
+        "smtp_password": n.get("smtp_password", ""),
+        "smtp_use_tls": bool(n.get("smtp_use_tls", False)),
+        "from_address": n.get("from_address", ""),
+        "to_addresses": n.get("to_addresses", []),
+        "warning_pct": n.get("warning_pct", 80),
+        "events": {
+            "warning": bool((n.get("events") or {}).get("warning", True)),
+            "guests_shutdown": bool((n.get("events") or {}).get("guests_shutdown", True)),
+            "hosts_shutdown": bool((n.get("events") or {}).get("hosts_shutdown", True)),
+            "power_restored": bool((n.get("events") or {}).get("power_restored", True)),
+        },
+    })
+
+
+@app.route("/api/notifications/config", methods=["POST"])
+@requires_auth
+def api_notifications_config_post():
+    cfg = pmlib.load_config()
+    data = request.get_json(force=True, silent=True) or {}
+    err = pmlib.validate_notifications_input(data)
+    if err:
+        return jsonify({"ok": False, "msg": err}), 400
+    events_in = data.get("events") or {}
+    cfg.setdefault("notifications", {})
+    cfg["notifications"].update({
+        "smtp_host": (data.get("smtp_host") or "").strip(),
+        "smtp_port": int(data.get("smtp_port") or 25),
+        "smtp_user": (data.get("smtp_user") or "").strip(),
+        "smtp_password": data.get("smtp_password") or "",
+        "smtp_use_tls": bool(data.get("smtp_use_tls", False)),
+        "from_address": (data.get("from_address") or "").strip(),
+        "to_addresses": pmlib._parse_recipients(data.get("to_addresses")),
+        "warning_pct": int(data.get("warning_pct") or 80),
+        "events": {k: bool(events_in.get(k, True)) for k in pmlib.EVENT_NAMES},
+    })
+    pmlib.save_config(cfg)
+    return jsonify({"ok": True, "msg": "saved"})
+
+
+@app.route("/api/notifications/test", methods=["POST"])
+@requires_auth
+def api_notifications_test():
+    cfg = pmlib.load_config()
+    subject = "[nutshutdown] test email"
+    body = ("This is a test email from the nutshutdown web UI.\n\n"
+            "If you got this, your SMTP settings work and alerts will fire on a "
+            "real outage.\n")
+    ok, msg = pmlib.send_email(cfg, subject, body)
+    return jsonify({"ok": ok, "msg": msg})
+
+
 @app.route("/api/ups/config", methods=["POST"])
 @requires_auth
 def api_ups_config_post():
@@ -396,6 +456,71 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
   </section>
 
   <section class="card" style="grid-column:1 / -1">
+    <h2>Notifications (email)</h2>
+    <p class="muted" style="margin:0 0 10px 0;font-size:12px">
+      Email alerts fire from the cron worker when the listed events happen.
+      Each event sends at most once per outage; on power restored, the bookkeeping
+      resets. Use a "Send test email" to verify SMTP before relying on it.
+    </p>
+    <div class="row" style="align-items:flex-end;gap:10px;flex-wrap:wrap">
+      <label style="display:flex;flex-direction:column;gap:2px">
+        <span class="muted" style="font-size:11px">SMTP host</span>
+        <input id="n-host" type="text" placeholder="smtp.gst.co.th" style="width:200px">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:2px">
+        <span class="muted" style="font-size:11px">Port</span>
+        <input id="n-port" type="number" min="1" max="65535" style="width:80px">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:2px">
+        <span class="muted" style="font-size:11px">SMTP user (optional)</span>
+        <input id="n-user" type="text" autocomplete="off" style="width:160px">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:2px">
+        <span class="muted" style="font-size:11px">SMTP password (optional)</span>
+        <input id="n-pass" type="password" autocomplete="new-password" style="width:160px">
+      </label>
+      <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:4px;margin-bottom:6px">
+        <input id="n-tls" type="checkbox"> STARTTLS / TLS
+      </label>
+    </div>
+    <div class="row" style="align-items:flex-end;gap:10px;margin-top:10px;flex-wrap:wrap">
+      <label style="display:flex;flex-direction:column;gap:2px">
+        <span class="muted" style="font-size:11px">From address</span>
+        <input id="n-from" type="text" placeholder="notify@gst.co.th" style="width:240px">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:240px">
+        <span class="muted" style="font-size:11px">To (comma-separated)</span>
+        <input id="n-to" type="text" placeholder="you@example.com, oncall@example.com" style="width:100%">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:2px">
+        <span class="muted" style="font-size:11px">Warning at battery %</span>
+        <input id="n-warn" type="number" min="1" max="100" style="width:90px">
+      </label>
+    </div>
+    <div class="row" style="gap:18px;margin-top:14px;flex-wrap:wrap">
+      <span class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em">Send email on:</span>
+      <label class="muted" style="font-size:13px;display:flex;align-items:center;gap:4px">
+        <input id="n-ev-warning" type="checkbox"> Warning threshold hit
+      </label>
+      <label class="muted" style="font-size:13px;display:flex;align-items:center;gap:4px">
+        <input id="n-ev-guests" type="checkbox"> Guest shutdown stage
+      </label>
+      <label class="muted" style="font-size:13px;display:flex;align-items:center;gap:4px">
+        <input id="n-ev-hosts" type="checkbox"> Host shutdown stage
+      </label>
+      <label class="muted" style="font-size:13px;display:flex;align-items:center;gap:4px">
+        <input id="n-ev-restored" type="checkbox"> Power restored
+      </label>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button id="n-save-btn" onclick="saveNotifications()">Save</button>
+      <button class="ghost" onclick="testNotificationEmail()">Send test email</button>
+      <span style="flex:1"></span>
+    </div>
+    <p id="n-save-msg" class="muted" style="font-size:12px;margin:8px 0 0 0;min-height:1em"></p>
+  </section>
+
+  <section class="card" style="grid-column:1 / -1">
     <h2>Hosts</h2>
     <table id="hosts-table">
       <thead><tr><th>Enabled</th><th>IP</th><th>Label</th><th>Note</th><th></th></tr></thead>
@@ -546,10 +671,10 @@ async function refresh(){
   document.getElementById("log-tail").textContent = s.log_tail.join("\n");
 
   // populate UPS connection form (only if user hasn't typed into it)
-  if(document.activeElement && document.activeElement.id &&
-     document.activeElement.id.startsWith("ups-") &&
-     document.activeElement.tagName === "INPUT"){ /* keep editing */ }
-  else {
+  const focusId = document.activeElement && document.activeElement.id || "";
+  const isUpsFocus = focusId.startsWith("ups-") && document.activeElement.tagName === "INPUT";
+  const isNFocus = focusId.startsWith("n-") && document.activeElement.tagName === "INPUT";
+  if(!isUpsFocus){
     try {
       const u = await api("/api/ups/config");
       document.getElementById("ups-name").value = u.name || "";
@@ -560,6 +685,60 @@ async function refresh(){
       document.getElementById("ups-snmpv").textContent = u.snmp_version || "?";
     } catch(e){ /* ignore */ }
   }
+  if(!isNFocus){
+    try {
+      const n = await api("/api/notifications/config");
+      document.getElementById("n-host").value = n.smtp_host || "";
+      document.getElementById("n-port").value = n.smtp_port || 25;
+      document.getElementById("n-user").value = n.smtp_user || "";
+      document.getElementById("n-pass").value = n.smtp_password || "";
+      document.getElementById("n-tls").checked = !!n.smtp_use_tls;
+      document.getElementById("n-from").value = n.from_address || "";
+      document.getElementById("n-to").value = (n.to_addresses||[]).join(", ");
+      document.getElementById("n-warn").value = n.warning_pct || 80;
+      document.getElementById("n-ev-warning").checked = !!n.events.warning;
+      document.getElementById("n-ev-guests").checked = !!n.events.guests_shutdown;
+      document.getElementById("n-ev-hosts").checked = !!n.events.hosts_shutdown;
+      document.getElementById("n-ev-restored").checked = !!n.events.power_restored;
+    } catch(e){ /* ignore */ }
+  }
+}
+
+async function saveNotifications(){
+  const body = {
+    smtp_host: document.getElementById("n-host").value.trim(),
+    smtp_port: parseInt(document.getElementById("n-port").value) || 25,
+    smtp_user: document.getElementById("n-user").value.trim(),
+    smtp_password: document.getElementById("n-pass").value,
+    smtp_use_tls: document.getElementById("n-tls").checked,
+    from_address: document.getElementById("n-from").value.trim(),
+    to_addresses: document.getElementById("n-to").value,
+    warning_pct: parseInt(document.getElementById("n-warn").value) || 80,
+    events: {
+      warning: document.getElementById("n-ev-warning").checked,
+      guests_shutdown: document.getElementById("n-ev-guests").checked,
+      hosts_shutdown: document.getElementById("n-ev-hosts").checked,
+      power_restored: document.getElementById("n-ev-restored").checked,
+    },
+  };
+  const btn = document.getElementById("n-save-btn");
+  const msg = document.getElementById("n-save-msg");
+  btn.disabled = true; msg.textContent = "saving …"; msg.style.color = "var(--muted)";
+  const r = await fetch("/api/notifications/config", {method:"POST",
+    headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  const data = await r.json().catch(()=>({ok:false,msg:"bad response"}));
+  btn.disabled = false;
+  msg.textContent = (data.ok ? "saved" : "save failed: ") + (data.msg || "");
+  msg.style.color = data.ok ? "var(--ok)" : "var(--bad)";
+}
+
+async function testNotificationEmail(){
+  const msg = document.getElementById("n-save-msg");
+  msg.textContent = "sending test email …"; msg.style.color = "var(--muted)";
+  const r = await fetch("/api/notifications/test", {method:"POST"});
+  const data = await r.json().catch(()=>({ok:false,msg:"bad response"}));
+  msg.textContent = (data.ok ? "test email sent: " : "test email failed: ") + (data.msg || "");
+  msg.style.color = data.ok ? "var(--ok)" : "var(--bad)";
 }
 
 async function saveUpsConfig(){
