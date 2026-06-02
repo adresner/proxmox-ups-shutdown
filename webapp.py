@@ -42,6 +42,7 @@ def requires_auth(view):
 # --- Read endpoints --------------------------------------------------------
 
 @app.route("/")
+@requires_auth
 def index():
     return render_template_string(PAGE)
 
@@ -337,8 +338,8 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
     </table>
     <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
     <div class="row">
-      <input id="new-ip" type="text" placeholder="10.0.0.x" style="width:140px">
-      <input id="new-label" type="text" placeholder="label (e.g. pve-01)" style="width:160px">
+      <input id="new-ip" type="text" placeholder="192.168.1.x" style="width:140px">
+      <input id="new-label" type="text" placeholder="label (e.g. hq-pv5)" style="width:160px">
       <input id="new-note" type="text" placeholder="note (optional)" style="flex:1;min-width:160px">
       <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:4px">
         <input id="new-pushkey" type="checkbox"> push SSH key on add
@@ -489,8 +490,10 @@ async function saveUpsConfig(){
   refresh();
 }
 async function toggle(ip, enabled){
-  await api("/api/host/"+ip, {method:"PATCH", headers:{"Content-Type":"application/json"},
-                              body: JSON.stringify({enabled})});
+  const r = await fetch("/api/host/"+ip, {method:"PATCH",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({enabled})});
+  if(!r.ok){ alert("toggle failed: "+r.status+" "+await r.text()); }
   refresh();
 }
 async function addHost(){
@@ -570,7 +573,8 @@ async function pushKey(ip, label){
 }
 async function removeHost(ip){
   if(!confirm("Remove "+ip+" from config?")) return;
-  await fetch("/api/host/"+ip, {method:"DELETE"});
+  const r = await fetch("/api/host/"+ip, {method:"DELETE"});
+  if(!r.ok){ alert("remove failed: "+r.status+" "+await r.text()); return; }
   refresh();
 }
 async function saveThresholds(){
@@ -583,7 +587,8 @@ async function saveThresholds(){
 }
 async function resetState(){
   if(!confirm("Reset state to NORMAL? Do this only if you're sure the state file is stale.")) return;
-  await fetch("/api/state/reset", {method:"POST"});
+  const r = await fetch("/api/state/reset", {method:"POST"});
+  if(!r.ok){ alert("reset failed: "+r.status+" "+await r.text()); return; }
   refresh();
 }
 async function simulate(){

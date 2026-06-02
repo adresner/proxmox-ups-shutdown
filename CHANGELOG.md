@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — Auth fix
+
+### Fixed
+
+- **Mutating buttons (Remove, Toggle, Reset State) silently failed.** Browsers
+  don't show the Basic Auth login dialog for `fetch()` requests — only for
+  top-level navigations — so without first authenticating via a navigation
+  the UI was sending DELETE/PATCH/POST without credentials and the server
+  was rejecting them with 401. The buttons returned no visible feedback,
+  making them appear broken.
+- **The index page now requires auth.** Loading the dashboard prompts for
+  login once per browser session via the standard browser dialog, after
+  which all mutating buttons work.
+- Added explicit error-handling to `toggle`, `removeHost`, and `resetState`
+  so any future non-2xx response is surfaced as an alert instead of being
+  silently swallowed.
+
 ## [0.1.0] — Initial release
 
 First public version. Everything works end-to-end against an APC Smart-UPS
