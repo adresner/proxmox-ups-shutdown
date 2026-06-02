@@ -12,6 +12,7 @@ import os
 import re
 import smtplib
 import socket
+import ssl
 import subprocess
 import time
 from dataclasses import dataclass
@@ -567,13 +568,20 @@ def send_email(cfg: dict, subject: str, body: str) -> tuple[bool, str]:
     msg["Subject"] = subject
     msg.set_content(body)
 
+    # Self-signed certs are common on internal SMTP relays; encrypt but skip
+    # hostname/CA verification. Confidentiality without PKI is the right
+    # tradeoff for a homelab tool talking to its own relay.
+    tls_ctx = ssl.create_default_context()
+    tls_ctx.check_hostname = False
+    tls_ctx.verify_mode = ssl.CERT_NONE
+
     try:
         if use_tls and port == 465:
-            client = smtplib.SMTP_SSL(host, port, timeout=15)
+            client = smtplib.SMTP_SSL(host, port, timeout=15, context=tls_ctx)
         else:
             client = smtplib.SMTP(host, port, timeout=15)
             if use_tls:
-                client.starttls()
+                client.starttls(context=tls_ctx)
         try:
             if user:
                 client.login(user, password)
