@@ -34,22 +34,34 @@ def main() -> int:
 
     status = ups.get("ups.status", "")
     charge = ups["_charge"]
+    runtime_s = ups["_runtime_s"]
     state = pmlib.read_state(cfg)
     retry_ips = pmlib.read_guest_retry(cfg)
     action = pmlib.decide_action(cfg, status, charge, state,
-                                 guest_retry_pending=bool(retry_ips))
+                                 guest_retry_pending=bool(retry_ips),
+                                 runtime_s=runtime_s)
+
+    if ups["_on_battery"]:
+        # One sample per on-battery tick. pmlib.outage_history parses these
+        # for the "% vs runtime" stats, so keep the format stable.
+        load = ups.get("_load_pct")
+        log.info(f"Power Failure Detected. On Battery. Charge: {charge}%, "
+                 f"runtime: {runtime_s}s"
+                 + (f", load: {load}%" if load is not None else ""))
+        th = pmlib.thresholds(cfg)
+        if th["mode"] == "runtime" and not runtime_s:
+            log.warning("UPS reports no runtime; using battery % thresholds "
+                        "this tick")
 
     # Warning email — fires once per outage when battery first drops below
-    # warning_pct, regardless of whether the next stage has been reached yet.
+    # warning_pct, while the guest stage hasn't been reached yet.
     notif = cfg.get("notifications", {})
     warn_pct = int(notif.get("warning_pct", 80) or 80)
-    if (ups["_on_battery"] and charge <= warn_pct
-            and charge > cfg["thresholds"]["vm_shutdown_pct"]):
+    guest_hit, _ = pmlib.stage_hits(cfg, charge, runtime_s)
+    if ups["_on_battery"] and charge <= warn_pct and not guest_hit:
         pmlib.notify_event(cfg, "warning", ups, dry_run=dry_run, log=log)
 
     if action == "noop":
-        if ups["_on_battery"] and state == pmlib.NORMAL:
-            log.info(f"Power Failure Detected. On Battery. Charge: {charge}%")
         return 0
 
     if action == "reset_normal":
@@ -61,7 +73,8 @@ def main() -> int:
 
     if action == "shutdown_guests":
         log.warning(
-            f"Battery {charge}% <= {cfg['thresholds']['vm_shutdown_pct']}%. "
+            f"Guest threshold reached ({pmlib.stage_label(cfg, 'vm', runtime_s)}; "
+            f"{pmlib.reading_label(charge, runtime_s)}). "
             f"Shutting down GUESTS. (dry_run={dry_run})"
         )
         results = pmlib.shutdown_guests(cfg, dry_run=dry_run, log=log)
@@ -91,7 +104,8 @@ def main() -> int:
 
     if action == "shutdown_hosts":
         log.critical(
-            f"Battery {charge}% <= {cfg['thresholds']['host_shutdown_pct']}%. "
+            f"Host threshold reached ({pmlib.stage_label(cfg, 'host', runtime_s)}; "
+            f"{pmlib.reading_label(charge, runtime_s)}). "
             f"Shutting down HOSTS. (dry_run={dry_run})"
         )
         pmlib.shutdown_hosts(cfg, dry_run=dry_run, log=log)

@@ -95,6 +95,14 @@ def read_ups(ups_name: str) -> dict[str, Any]:
         data["_runtime_s"] = int(data.get("battery.runtime", "0"))
     except ValueError:
         data["_runtime_s"] = 0
+    try:
+        data["_load_pct"] = float(data.get("ups.load", ""))
+    except ValueError:
+        data["_load_pct"] = None
+    try:
+        data["_realpower_w"] = int(float(data.get("ups.realpower", "")))
+    except ValueError:
+        data["_realpower_w"] = None
     return data
 
 
@@ -370,20 +378,86 @@ def push_ssh_key(host: Host, cfg: dict, password: str) -> tuple[bool, str]:
     return False, msg or f"ssh-copy-id exit {out.returncode}"
 
 
+# --- Thresholds: battery % or runtime minutes ------------------------------
+#
+# thresholds.mode picks which pair triggers the stages:
+#   "percent" -> vm_shutdown_pct / host_shutdown_pct  (battery charge %)
+#   "runtime" -> vm_shutdown_min / host_shutdown_min  (UPS runtime estimate)
+# Both pairs are always stored, so flipping modes loses nothing. In runtime
+# mode, a tick where the UPS reports no runtime (0 / missing) falls back to
+# the percent pair, so a flaky runtime reading can never block a shutdown.
+
+THRESHOLD_MODES = ("percent", "runtime")
+THRESHOLD_DEFAULTS = {"mode": "percent", "vm_shutdown_pct": 60,
+                      "host_shutdown_pct": 20, "vm_shutdown_min": 10,
+                      "host_shutdown_min": 4}
+RUNTIME_MAX_MIN = 240
+
+
+def thresholds(cfg: dict) -> dict:
+    return {**THRESHOLD_DEFAULTS, **(cfg.get("thresholds") or {})}
+
+
+def validate_thresholds(th: dict) -> str | None:
+    """Return an error string, or None if the thresholds are usable."""
+    if th.get("mode") not in THRESHOLD_MODES:
+        return f"mode must be one of {', '.join(THRESHOLD_MODES)}"
+    try:
+        vm, host = int(th["vm_shutdown_pct"]), int(th["host_shutdown_pct"])
+        vm_m, host_m = int(th["vm_shutdown_min"]), int(th["host_shutdown_min"])
+    except (KeyError, TypeError, ValueError):
+        return "all four thresholds must be integers"
+    if not 0 < host < vm <= 100:
+        return "require 0 < host % < guest % <= 100"
+    if not 0 < host_m < vm_m <= RUNTIME_MAX_MIN:
+        return f"require 0 < host min < guest min <= {RUNTIME_MAX_MIN}"
+    return None
+
+
+def effective_mode(cfg: dict, runtime_s: int | None) -> str:
+    """The mode actually used this tick (runtime falls back to percent)."""
+    if thresholds(cfg)["mode"] == "runtime" and runtime_s and runtime_s > 0:
+        return "runtime"
+    return "percent"
+
+
+def stage_hits(cfg: dict, charge: int, runtime_s: int | None) -> tuple[bool, bool]:
+    """(guest stage reached, host stage reached) under the effective mode."""
+    th = thresholds(cfg)
+    if effective_mode(cfg, runtime_s) == "runtime":
+        m = runtime_s / 60
+        return m <= th["vm_shutdown_min"], m <= th["host_shutdown_min"]
+    return charge <= th["vm_shutdown_pct"], charge <= th["host_shutdown_pct"]
+
+
+def stage_label(cfg: dict, stage: str, runtime_s: int | None = None) -> str:
+    """Human text for a stage's threshold, e.g. '70%' or '14 min runtime'."""
+    th = thresholds(cfg)
+    mode = th["mode"] if runtime_s is None else effective_mode(cfg, runtime_s)
+    if mode == "runtime":
+        return f"{th[f'{stage}_shutdown_min']} min runtime"
+    return f"{th[f'{stage}_shutdown_pct']}%"
+
+
+def reading_label(charge: int, runtime_s: int | None) -> str:
+    rt = f"{runtime_s // 60}m {runtime_s % 60:02d}s" if runtime_s else "unknown"
+    return f"battery {charge}%, runtime {rt}"
+
+
 # --- Decision logic --------------------------------------------------------
 
 def decide_action(cfg: dict, status: str, charge: int, current_state: str,
-                  guest_retry_pending: bool = False) -> str:
-    """Pure function: given UPS status + charge + current state, return one of
-    'noop', 'shutdown_guests', 'retry_guests', 'shutdown_hosts', 'reset_normal'.
+                  guest_retry_pending: bool = False,
+                  runtime_s: int | None = None) -> str:
+    """Pure function: given UPS status + charge/runtime + current state,
+    return one of 'noop', 'shutdown_guests', 'retry_guests',
+    'shutdown_hosts', 'reset_normal'.
 
-    'retry_guests' re-runs the guest stage only on hosts whose previous
-    attempt failed (unreachable, timeout), every tick while still on battery
-    and above the host threshold.
+    Thresholds are battery % or runtime minutes per thresholds.mode (see
+    stage_hits). 'retry_guests' re-runs the guest stage only on hosts whose
+    previous attempt failed (unreachable, timeout), every tick while still
+    on battery and above the host threshold.
     """
-    th = cfg["thresholds"]
-    vm_pct = th["vm_shutdown_pct"]
-    host_pct = th["host_shutdown_pct"]
     on_battery = "OB" in status or "LB" in status
     online = "OL" in status
 
@@ -391,11 +465,12 @@ def decide_action(cfg: dict, status: str, charge: int, current_state: str,
         return "reset_normal"
 
     if on_battery:
-        if charge <= host_pct and current_state != HOSTS_DOWN:
+        guest_hit, host_hit = stage_hits(cfg, charge, runtime_s)
+        if host_hit and current_state != HOSTS_DOWN:
             return "shutdown_hosts"
-        if host_pct < charge <= vm_pct and current_state == NORMAL:
+        if guest_hit and current_state == NORMAL:
             return "shutdown_guests"
-        if (charge > host_pct and current_state == GUESTS_DOWN
+        if (not host_hit and current_state == GUESTS_DOWN
                 and guest_retry_pending):
             return "retry_guests"
 
@@ -709,25 +784,28 @@ def _format_event_email(cfg: dict, event: str, ups: dict) -> tuple[str, str]:
     hostname = socket.gethostname()
     enabled = enabled_hosts(cfg)
     host_list = ", ".join(f"{h.label} ({h.ip})" for h in enabled) or "(none enabled)"
-    th = cfg["thresholds"]
+    vm_lbl = stage_label(cfg, "vm", runtime_s)
+    host_lbl = stage_label(cfg, "host", runtime_s)
 
     if event == "warning":
         subject = f"[nutshutdown] UPS battery warning — {charge}%"
         body = (f"The UPS reports it is on battery and the charge has dropped "
                 f"to {charge}%.\n\nRuntime estimate: {runtime_str}\n"
-                f"Next stage: guest shutdown at {th['vm_shutdown_pct']}% "
-                f"(then host shutdown at {th['host_shutdown_pct']}%).\n\n"
+                f"Next stage: guest shutdown at {vm_lbl} "
+                f"(then host shutdown at {host_lbl}).\n\n"
                 f"UPS: {model}\nEnabled hosts: {host_list}\n"
                 f"Orchestrator: {hostname}\n")
     elif event == "guests_shutdown":
         subject = f"[nutshutdown] Guest shutdown started — battery {charge}%"
-        body = (f"Battery dropped to {charge}% (<= {th['vm_shutdown_pct']}%). "
+        body = (f"Reached the guest-shutdown threshold ({vm_lbl}): "
+                f"battery {charge}%, runtime {runtime_str}. "
                 f"qm shutdown and pct shutdown have been issued to every "
                 f"enabled host.\n\nRuntime estimate: {runtime_str}\n"
                 f"Hosts: {host_list}\nOrchestrator: {hostname}\n")
     elif event == "hosts_shutdown":
         subject = f"[nutshutdown] Host shutdown started — battery {charge}%"
-        body = (f"Battery dropped to {charge}% (<= {th['host_shutdown_pct']}%). "
+        body = (f"Reached the host-shutdown threshold ({host_lbl}): "
+                f"battery {charge}%, runtime {runtime_str}. "
                 f"shutdown -h now has been issued to every enabled host. This "
                 f"is the last email this outage.\n\nHosts: {host_list}\n"
                 f"Orchestrator: {hostname}\n")
@@ -1038,3 +1116,94 @@ def maybe_run_scheduled_selftest(cfg: dict, *, log=None) -> dict | None:
                 f"{c['name']}: {c['msg']}" for c in result["checks"] if not c["ok"])))
     selftest_notify(cfg, result, prev, log=log)
     return result
+
+
+# --- Outage history (for the % vs runtime stats) ---------------------------
+#
+# Parsed from the worker log. Every on-battery tick logs a sample line:
+#   "Power Failure Detected. On Battery. Charge: 74%, runtime: 980s, load: 34.1%"
+# Older logs have the same line without runtime/load, and some ticks only
+# appear as "Battery 70% <= 70%" stage lines; both are understood.
+
+_SAMPLE_RE = re.compile(
+    r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ (?:[A-Z]+ )?"
+    r"(?:Power Failure Detected\. On Battery\. Charge: (\d+)%"
+    r"(?:, runtime: (\d+)s)?(?:, load: ([\d.]+)%)?"
+    r"|Battery (\d+)% <= )")
+_EVENT_RE = re.compile(
+    r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ (?:[A-Z]+ )?.*?"
+    r"(Power Restored|Shutting down GUESTS|Shutting down HOSTS)")
+OUTAGE_GAP_S = 15 * 60
+
+
+def outage_history(cfg: dict, limit: int = 20) -> dict:
+    """Summarise past outages from the log: duration, charge drop, drain rate."""
+    from datetime import datetime
+    path = Path(cfg["paths"]["log_file"])
+    outages: list[dict] = []
+    cur: dict | None = None
+
+    def close():
+        nonlocal cur
+        if cur and cur["samples"]:
+            outages.append(cur)
+        cur = None
+
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        m = _SAMPLE_RE.match(line)
+        if m:
+            ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+            charge = int(m.group(2) or m.group(5))
+            if cur and (ts - cur["last_ts"]).total_seconds() > OUTAGE_GAP_S:
+                close()
+            if cur is None:
+                cur = {"samples": [], "stages": set(), "restored": False}
+            cur["samples"].append((ts, charge,
+                                   int(m.group(3)) if m.group(3) else None,
+                                   float(m.group(4)) if m.group(4) else None))
+            cur["last_ts"] = ts
+            continue
+        e = _EVENT_RE.match(line)
+        if e and cur:
+            ets = datetime.strptime(e.group(1), "%Y-%m-%d %H:%M:%S")
+            if (ets - cur["last_ts"]).total_seconds() > OUTAGE_GAP_S:
+                close()  # event belongs to no recent outage
+                continue
+            if e.group(2) == "Power Restored":
+                cur["restored"] = True
+                cur["end_ts"] = datetime.strptime(e.group(1), "%Y-%m-%d %H:%M:%S")
+                close()
+            else:
+                cur["stages"].add("guests" if "GUESTS" in e.group(2) else "hosts")
+    close()
+
+    rows = []
+    for o in outages:
+        s = o["samples"]
+        t0, c0 = s[0][0], s[0][1]
+        low = min(s, key=lambda x: x[1])
+        end = o.get("end_ts") or s[-1][0]
+        dur_min = (end - t0).total_seconds() / 60
+        span_min = (low[0] - t0).total_seconds() / 60
+        rate = round((c0 - low[1]) / span_min, 1) if span_min >= 2 and low[1] < c0 else None
+        loads = [x[3] for x in s if x[3] is not None]
+        rows.append({
+            "start": t0.strftime("%Y-%m-%d %H:%M"),
+            "duration_min": round(dur_min, 1),
+            "charge_start": c0,
+            "charge_low": low[1],
+            "runtime_start_s": s[0][2],
+            "load_avg_pct": round(sum(loads) / len(loads), 1) if loads else None,
+            "drain_pct_per_min": rate,
+            "stages": sorted(o["stages"]),
+            "restored": o["restored"],
+            "samples": len(s),
+        })
+    rates = sorted(r["drain_pct_per_min"] for r in rows if r["drain_pct_per_min"])
+    median = rates[len(rates) // 2] if rates else None
+    return {"outages": list(reversed(rows))[:limit], "median_drain_pct_per_min": median,
+            "outages_with_rate": len(rates), "total_outages": len(rows)}

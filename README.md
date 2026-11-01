@@ -113,16 +113,29 @@ are already down well before then.
 ### Trigger logic
 
 A single pure function (`pmlib.decide_action`) drives both the cron worker
-and the "simulate" button. Given the UPS status, the battery %, and the
-current state file value:
+and the "simulate" button. Given the UPS status, the battery % and runtime
+estimate, and the current state file value:
 
-| UPS status | Battery charge | Action |
+| UPS status | Reading | Action |
 |---|---|---|
 | `OL` (online) | any | If state ≠ NORMAL → reset to NORMAL ("Power Restored") |
-| `OB` / `LB` (on battery) | > `vm_shutdown_pct` | noop (logged once on the OB → battery transition) |
-| `OB` / `LB` | `host_pct < c ≤ vm_pct` | Shut down all guests on each enabled host; state → `GUESTS_DOWN` |
-| `OB` / `LB` | `> host_pct`, state `GUESTS_DOWN` | Retry the guest stage on hosts whose last attempt failed (unreachable, timeout) |
-| `OB` / `LB` | ≤ `host_shutdown_pct` | `shutdown -h now` on each enabled host; state → `HOSTS_DOWN` |
+| `OB` / `LB` (on battery) | above the guest threshold | noop (a sample line with charge/runtime/load is logged every minute on battery) |
+| `OB` / `LB` | at/below guest, above host threshold | Shut down all guests on each enabled host; state → `GUESTS_DOWN` |
+| `OB` / `LB` | above host threshold, state `GUESTS_DOWN` | Retry the guest stage on hosts whose last attempt failed (unreachable, timeout) |
+| `OB` / `LB` | at/below host threshold | `shutdown -h now` on each enabled host; state → `HOSTS_DOWN` |
+
+**Battery % or runtime.** `thresholds.mode` picks what the thresholds are
+measured in: `percent` uses `vm_shutdown_pct` / `host_shutdown_pct`,
+`runtime` uses `vm_shutdown_min` / `host_shutdown_min` (minutes of the UPS's
+own runtime estimate). Both pairs are always stored, so you can flip modes
+in the web UI ("Trigger on" switch) or with `./manage.py set-mode` without
+losing either. In runtime mode, a minute where the UPS reports no runtime
+falls back to the % pair, so a bad reading can't block a shutdown.
+
+Runtime mode tracks load: if the guest stage cuts the load, runtime goes
+back up and the host stage waits longer, which a fixed % can't do. The
+trade-off is that the UPS's runtime estimate jumps when load changes, so a
+short load spike can trigger a stage a little early.
 
 Each stage runs **once** per outage (gated on `/var/run/power_state`) so the
 1-minute cron doesn't spam shutdown requests. The one exception: if a host's
@@ -240,7 +253,8 @@ UI anywhere beyond a trusted LAN.**
 - **UPS panel** — live status pill, charge bar (warn/crit colors), runtime
   estimate, model.
 - **State machine** — current state (`NORMAL` / `GUESTS_DOWN` / `HOSTS_DOWN`),
-  threshold editor, "Reset state → NORMAL" button.
+  "Trigger on: Battery % / Runtime (min)" switch, both threshold pairs,
+  "Reset state → NORMAL" button.
 - **UPS connection** — name, NMC IP, SNMP community, poll frequency. Edits
   rewrite `/etc/nut/ups.conf`, restart NUT, and verify the new config works
   by polling `upsc`. If the verify fails the old config is automatically
@@ -248,6 +262,9 @@ UI anywhere beyond a trusted LAN.**
 - **Hosts table** — toggle enable/disable, per-row "Test SSH" + "Push key" +
   "Reset host key" + "Remove". Reinstalled a host? Click "Reset host key"
   (or just "Push key", which forgets the old key first). Add-host row with optional one-shot key push.
+- **Battery % vs runtime** — live charge / runtime / load / watts, a
+  conversion table between the two kinds of threshold (previews unsaved
+  edits), and a table of past outages from the log with their drain rate.
 - **Self-test** — see below. Header pills show when the cron worker last ran
   and the last self-test result.
 - **Simulate** — enter a fake charge %, see exactly which action would fire
@@ -298,8 +315,9 @@ Everything the web UI does is also available via `manage.py`:
 | Push SSH key (interactive) | `./manage.py push-key 10.0.0.21` |
 | Forget stale host key (after reinstalling a host) | `./manage.py forget-key 10.0.0.21` |
 | Verify SSH | `./manage.py test-ssh` (all) or `./manage.py test-ssh 10.0.0.21` |
-| Change thresholds | `./manage.py set-threshold vm 55` / `set-threshold host 15` |
-| Dry-run at fake charge | `./manage.py simulate 45` |
+| Change thresholds | `./manage.py set-threshold vm 55` / `set-threshold host 15` (%), `vm-min 10` / `host-min 4` (minutes) |
+| Switch trigger mode | `./manage.py set-mode runtime` / `set-mode percent` |
+| Dry-run at fake charge | `./manage.py simulate 45` (add `--runtime 8` to test runtime mode) |
 | Reset state file | `./manage.py reset-state` |
 | Self-test (UPS, SSH + qm/pct, SMTP, worker) | `./manage.py self-test` |
 | Dry-run real worker | `DRY_RUN=1 /opt/nutshutdown/power_monitor.py` |
@@ -341,14 +359,15 @@ Everything the web UI does is also available via `manage.py`:
 | GET    | `/api/status` | yes | UPS + state + hosts + log tail |
 | GET    | `/api/ups/config` | yes | Current `ups.conf` section keys + `ups_name` |
 | POST   | `/api/ups/config` | yes | `{name, host, community, pollfreq}` — write, restart NUT, verify, auto-rollback |
-| POST   | `/api/simulate` | yes | `{charge, on_battery}` — pure dry-run |
+| POST   | `/api/simulate` | yes | `{charge, runtime_min, on_battery}` — pure dry-run |
 | POST   | `/api/test-ssh` | yes | `{ip}` or empty for all |
 | POST   | `/api/host/<ip>/push-key` | yes | `{password}` — `sshpass + ssh-copy-id`; password via env var, never logged |
 | POST   | `/api/host` | yes | Add: `{ip, label, note, enabled}` |
 | PATCH  | `/api/host/<ip>` | yes | `{enabled, label, note}` |
 | DELETE | `/api/host/<ip>` | yes | Also forgets the host's saved SSH host key |
 | POST   | `/api/host/<ip>/reset-hostkey` | yes | Forget saved host key (after a reinstall); returns current fingerprint |
-| POST   | `/api/thresholds` | yes | `{vm_shutdown_pct, host_shutdown_pct}` |
+| POST   | `/api/thresholds` | yes | `{mode, vm_shutdown_pct, host_shutdown_pct, vm_shutdown_min, host_shutdown_min}`; omitted keys keep their value |
+| GET    | `/api/stats` | yes | Past outages parsed from the log (duration, charge drop, drain %/min) + median drain |
 | POST   | `/api/state/reset` | yes | Force state → `NORMAL` |
 | GET    | `/api/selftest` | yes | Self-test settings, last result, server clock, worker heartbeat age |
 | POST   | `/api/selftest/config` | yes | `{enabled, hour, email_on_success}` |
@@ -365,11 +384,13 @@ flow uses sessions.
 
 ## Tuning
 
-- **`vm_shutdown_pct` / `host_shutdown_pct`**: with my SRT 5000 and a modest
-  load I see ~3 %/min drain on battery, so 60 → 20 gives ~13 minutes for
-  guests to finish their normal Windows/Linux shutdown sequences before the
-  hosts themselves go down. Tune to your runtime curve — `upsc <name>
-  battery.runtime` gives the UPS's own estimate.
+- **Thresholds**: the web UI's "Battery % vs runtime" card does the
+  conversion for you. It shows what each % threshold means in minutes at
+  the current load (and the reverse), plus every past outage parsed from the
+  log with its measured drain rate, and how long after a full battery each
+  stage would fire at that rate. With an SRT 5000 at ~35% load we measured
+  ~3.5 %/min in real outages, so 20% left only about 4 minutes of power.
+  `upsc <name> battery.runtime` gives the UPS's own estimate.
 - **`pollfreq`** (in `ups.conf`): how often NUT asks the NMC for fresh data.
   15s is the default; lower = more responsive but more SNMP chatter, higher
   = less network traffic but slower reaction.

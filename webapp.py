@@ -122,9 +122,12 @@ def api_status():
         "ups_status": ups.get("ups.status", "?"),
         "charge": ups.get("_charge", 0),
         "runtime_s": ups.get("_runtime_s", 0),
+        "load_pct": ups.get("_load_pct"),
+        "realpower_w": ups.get("_realpower_w"),
         "model": ups.get("device.model", "?"),
         "state": pmlib.read_state(cfg),
-        "thresholds": cfg["thresholds"],
+        "thresholds": pmlib.thresholds(cfg),
+        "effective_mode": pmlib.effective_mode(cfg, ups.get("_runtime_s", 0)),
         "ups_name": cfg["ups_name"],
         "hosts": [h for h in cfg["hosts"]],
         "log_tail": pmlib.tail_log(cfg, lines=30),
@@ -222,17 +225,28 @@ def api_simulate():
     cfg = pmlib.load_config()
     data = request.get_json(force=True, silent=True) or {}
     charge = int(data.get("charge", 100))
+    runtime_s = None
+    if data.get("runtime_min") not in (None, ""):
+        runtime_s = int(float(data["runtime_min"]) * 60)
     force_ob = bool(data.get("on_battery", True))
     status = "OB" if force_ob else "OL"
     state = pmlib.read_state(cfg)
-    action = pmlib.decide_action(cfg, status, charge, state)
+    action = pmlib.decide_action(cfg, status, charge, state, runtime_s=runtime_s)
     detail = []
     if action == "shutdown_guests":
         detail = pmlib.shutdown_guests(cfg, dry_run=True)
     elif action == "shutdown_hosts":
         detail = pmlib.shutdown_hosts(cfg, dry_run=True)
-    return jsonify({"status": status, "charge": charge, "state": state,
-                    "action": action, "detail": detail})
+    return jsonify({"status": status, "charge": charge, "runtime_s": runtime_s,
+                    "mode_used": pmlib.effective_mode(cfg, runtime_s),
+                    "state": state, "action": action, "detail": detail})
+
+
+@app.route("/api/stats")
+@requires_auth
+def api_stats():
+    """Outage history parsed from the worker log (drain rate, durations)."""
+    return jsonify(pmlib.outage_history(pmlib.load_config()))
 
 
 @app.route("/api/ups/config", methods=["GET"])
@@ -414,15 +428,18 @@ def api_host_patch(ip):
 def api_thresholds():
     cfg = pmlib.load_config()
     data = request.get_json(force=True, silent=True) or {}
-    try:
-        vm = int(data["vm_shutdown_pct"])
-        host = int(data["host_shutdown_pct"])
-    except (KeyError, ValueError, TypeError):
-        return jsonify({"error": "vm_shutdown_pct + host_shutdown_pct (int) required"}), 400
-    if not (0 < host < vm <= 100):
-        return jsonify({"error": "require 0 < host < vm <= 100"}), 400
-    cfg["thresholds"]["vm_shutdown_pct"] = vm
-    cfg["thresholds"]["host_shutdown_pct"] = host
+    # Any key left out keeps its current value (old clients send only the %s).
+    new = pmlib.thresholds(cfg)
+    for k in ("mode", "vm_shutdown_pct", "host_shutdown_pct",
+              "vm_shutdown_min", "host_shutdown_min"):
+        if k in data:
+            new[k] = data[k]
+    err = pmlib.validate_thresholds(new)
+    if err:
+        return jsonify({"error": err}), 400
+    cfg["thresholds"] = {"mode": new["mode"],
+                         **{k: int(new[k]) for k in ("vm_shutdown_pct", "host_shutdown_pct",
+                                                     "vm_shutdown_min", "host_shutdown_min")}}
     pmlib.save_config(cfg)
     return jsonify({"ok": True, "thresholds": cfg["thresholds"]})
 
@@ -476,6 +493,12 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
 .editable{cursor:pointer;padding:2px 4px;border-radius:3px;border:1px dashed transparent;display:inline-block;min-width:80px}
 .editable:hover{background:#0a0c10;border-color:var(--line)}
 .placeholder{color:var(--muted);font-style:italic;font-size:12px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{background:transparent;color:var(--muted);border:0;border-radius:0;padding:5px 12px;font-weight:600}
+.seg button.on{background:var(--accent);color:#03142e}
+.th-pair.off{opacity:.45}
+td.active,th.active{color:var(--ink);font-weight:600}
+td.dim{color:var(--muted)}
 </style></head><body>
 <header>
   <h1>nutserver — Proxmox graceful-shutdown orchestrator</h1>
@@ -506,20 +529,60 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
     <h2>State machine</h2>
     <div class="kv">
       <b>Current</b><span id="state-text">…</span>
-      <b>VM stage</b><span>battery ≤ <span id="th-vm">…</span>% → shut down guests</span>
-      <b>Host stage</b><span>battery ≤ <span id="th-host">…</span>% → shut down hosts</span>
+      <b>Guest stage</b><span id="th-vm-text">…</span>
+      <b>Host stage</b><span id="th-host-text">…</span>
     </div>
     <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
     <div class="row">
-      <label>VM% <input id="in-vm" type="number" min="1" max="100" style="width:70px"></label>
-      <label>Host% <input id="in-host" type="number" min="1" max="100" style="width:70px"></label>
+      <span class="muted" style="font-size:12px">Trigger on</span>
+      <span class="seg">
+        <button id="mode-percent" type="button" onclick="setMode('percent')">Battery %</button>
+        <button id="mode-runtime" type="button" onclick="setMode('runtime')">Runtime (min)</button>
+      </span>
+      <span id="mode-unsaved" class="pill warn" hidden>not saved yet</span>
+    </div>
+    <div class="row th-pair" id="pair-percent" style="margin-top:10px">
+      <label>Guest % <input id="in-vm" type="number" min="1" max="100" style="width:64px"></label>
+      <label>Host % <input id="in-host" type="number" min="1" max="100" style="width:64px"></label>
+    </div>
+    <div class="row th-pair" id="pair-runtime" style="margin-top:6px">
+      <label>Guest min <input id="in-vm-min" type="number" min="1" max="240" style="width:64px"></label>
+      <label>Host min <input id="in-host-min" type="number" min="1" max="240" style="width:64px"></label>
+    </div>
+    <div class="row" style="margin-top:10px">
       <button onclick="saveThresholds()">Save thresholds</button>
       <span style="flex:1"></span>
       <button class="danger" onclick="resetState()">Reset state → NORMAL</button>
     </div>
     <p class="muted" style="margin:8px 0 0 0;font-size:12px">
-      Host % must be lower than VM %. Reset only if you know the state file is stale.
+      Both pairs are kept; only the selected one triggers. Host must be lower
+      than guest. In runtime mode, if the UPS reports no runtime the % pair is
+      used for that minute. Reset only if you know the state file is stale.
     </p>
+  </section>
+
+  <section class="card" style="grid-column:1 / -1">
+    <h2>Battery % vs runtime</h2>
+    <p class="muted" style="margin:0 0 10px 0;font-size:12px">
+      Now: <span id="cv-live">…</span>. The conversions below assume the
+      current load and a roughly even drain, so treat them as estimates; runtime
+      rises when guests shut down and load drops.
+    </p>
+    <div style="overflow-x:auto">
+    <table id="cv-table">
+      <thead><tr><th>Stage</th><th>Battery % trigger</th><th>≈ runtime then</th>
+        <th>Runtime trigger</th><th>≈ battery % then</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+    <p id="hist-summary" style="margin:14px 0 6px 0;font-size:13px"></p>
+    <div style="overflow-x:auto">
+    <table id="hist-table">
+      <thead><tr><th>Outage start</th><th>On battery</th><th>Battery</th>
+        <th>Drain</th><th>Stages reached</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
   </section>
 
   <section class="card" style="grid-column:1 / -1">
@@ -682,7 +745,9 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
       <b>Nothing is actually shut down.</b>
     </p>
     <div class="row">
-      <label>Charge % <input id="sim-charge" type="number" value="55" min="0" max="100" style="width:80px"></label>
+      <label>Charge % <input id="sim-charge" type="number" value="55" min="0" max="100" style="width:70px"></label>
+      <label>Runtime min <input id="sim-runtime" type="number" min="0" max="240" placeholder="auto" style="width:70px"
+        title="Leave blank to estimate from the charge at the current load"></label>
       <button onclick="simulate()">Run simulation</button>
     </div>
     <pre id="sim-out" class="log" style="height:160px"></pre>
@@ -766,10 +831,28 @@ async function refresh(){
   bar.className = "bar" + (s.charge<=s.thresholds.host_shutdown_pct?" crit":
                            s.charge<=s.thresholds.vm_shutdown_pct?" low":"");
   document.getElementById("state-text").textContent = s.state;
-  document.getElementById("th-vm").textContent = s.thresholds.vm_shutdown_pct;
-  document.getElementById("th-host").textContent = s.thresholds.host_shutdown_pct;
-  document.getElementById("in-vm").value = s.thresholds.vm_shutdown_pct;
-  document.getElementById("in-host").value = s.thresholds.host_shutdown_pct;
+  lastStatus = s;
+  const th = s.thresholds;
+  const stageText = (pct, min) => th.mode === "runtime"
+    ? `runtime ≤ ${min} min` + (s.effective_mode === "percent" && s.ups_ok
+        ? ` (UPS reports no runtime now; ≤ ${pct}% used)` : "")
+    : `battery ≤ ${pct}%`;
+  document.getElementById("th-vm-text").textContent =
+    stageText(th.vm_shutdown_pct, th.vm_shutdown_min) + " → shut down guests";
+  document.getElementById("th-host-text").textContent =
+    stageText(th.host_shutdown_pct, th.host_shutdown_min) + " → shut down hosts";
+  const thFocus = ["in-vm","in-host","in-vm-min","in-host-min"].includes(
+    document.activeElement && document.activeElement.id);
+  if(!thFocus && !thDirty){
+    document.getElementById("in-vm").value = th.vm_shutdown_pct;
+    document.getElementById("in-host").value = th.host_shutdown_pct;
+    document.getElementById("in-vm-min").value = th.vm_shutdown_min;
+    document.getElementById("in-host-min").value = th.host_shutdown_min;
+    pendingMode = th.mode;
+  }
+  renderMode();
+  renderConversions();
+  loadHistory();
 
   const upsPill = document.getElementById("ups-pill");
   upsPill.textContent = s.ups_ok ? s.ups_status : "UPS ERR";
@@ -1064,14 +1147,91 @@ async function removeHost(ip){
   if(!r.ok){ alert("remove failed: "+r.status+" "+await r.text()); return; }
   refresh();
 }
+let lastStatus = null, pendingMode = null, thDirty = false;
+const num = id => parseInt(document.getElementById(id).value);
+
+function setMode(m){ pendingMode = m; thDirty = true; renderMode(); renderConversions(); }
+
+function renderMode(){
+  if(!lastStatus) return;
+  const m = pendingMode || lastStatus.thresholds.mode;
+  document.getElementById("mode-percent").className = m === "percent" ? "on" : "";
+  document.getElementById("mode-runtime").className = m === "runtime" ? "on" : "";
+  document.getElementById("pair-percent").classList.toggle("off", m !== "percent");
+  document.getElementById("pair-runtime").classList.toggle("off", m !== "runtime");
+  document.getElementById("mode-unsaved").hidden = m === lastStatus.thresholds.mode;
+}
+
+// Linear estimate at the current load: runtime per % of charge.
+function secsPerPct(){
+  const s = lastStatus;
+  return (s && s.ups_ok && s.charge > 0 && s.runtime_s > 0) ? s.runtime_s / s.charge : null;
+}
+function fmtMin(sec){ return sec == null ? "—" : (sec < 60 ? "<1 min" : Math.round(sec/60) + " min"); }
+
+function renderConversions(){
+  const s = lastStatus; if(!s) return;
+  const spp = secsPerPct();
+  const m = pendingMode || s.thresholds.mode;
+  const load = s.load_pct != null ? `, load ${s.load_pct}%` : "";
+  const watts = s.realpower_w != null ? ` (${s.realpower_w} W)` : "";
+  document.getElementById("cv-live").textContent = s.ups_ok
+    ? `battery ${s.charge}%, runtime ${fmtRuntime(s.runtime_s)}${load}${watts}`
+    : "UPS unreadable";
+  const pctOf = mins => spp ? Math.min(100, Math.round(mins * 60 / spp)) + "%" : "—";
+  // Read the inputs so the table previews unsaved edits too.
+  const rows = [
+    ["Guest shutdown", num("in-vm"), num("in-vm-min")],
+    ["Host shutdown",  num("in-host"), num("in-host-min")],
+  ];
+  const a = c => c ? "active" : "dim";
+  document.querySelector("#cv-table tbody").innerHTML = rows.map(([name, pct, min]) => `<tr>
+      <td>${name}</td>
+      <td class="${a(m==="percent")}">≤ ${isNaN(pct)?"?":pct}%</td>
+      <td class="${a(m==="percent")}">≈ ${spp && !isNaN(pct) ? fmtMin(pct*spp) : "—"}</td>
+      <td class="${a(m==="runtime")}">≤ ${isNaN(min)?"?":min} min</td>
+      <td class="${a(m==="runtime")}">≈ ${isNaN(min) ? "—" : pctOf(min)}</td></tr>`).join("");
+}
+
+async function loadHistory(){
+  let h; try { h = await api("/api/stats"); } catch(e){ return; }
+  const sum = document.getElementById("hist-summary");
+  const r = h.median_drain_pct_per_min;
+  const th = lastStatus ? lastStatus.thresholds : null;
+  if(r && th){
+    const from = p => Math.round((100 - p) / r);
+    sum.innerHTML = `<b>In real outages your battery drained ≈ ${r}%/min</b>
+      <span class="muted">(median of ${h.outages_with_rate} outage${h.outages_with_rate>1?"s":""} long enough to measure).
+      At that rate, starting full: guest stage (${th.vm_shutdown_pct}%) after ≈ ${from(th.vm_shutdown_pct)} min,
+      host stage (${th.host_shutdown_pct}%) after ≈ ${from(th.host_shutdown_pct)} min,
+      empty after ≈ ${Math.round(100 / r)} min.</span>`;
+  } else {
+    sum.innerHTML = `<span class="muted">No outage long enough to measure a drain rate yet.</span>`;
+  }
+  document.querySelector("#hist-table tbody").innerHTML = h.outages.length ? h.outages.map(o => `<tr>
+      <td>${esc(o.start)}</td>
+      <td>${o.duration_min < 1 ? "<1 min (blip)" : esc(o.duration_min) + " min"}</td>
+      <td>${o.charge_start}% → ${o.charge_low}%</td>
+      <td>${o.drain_pct_per_min ? o.drain_pct_per_min + "%/min" : "—"}</td>
+      <td class="muted">${o.stages.length ? esc(o.stages.join(", ")) : "none"}${o.restored ? "" : " (no restore logged)"}</td>
+    </tr>`).join("") : `<tr><td colspan="5" class="muted">no outages in the log</td></tr>`;
+}
+
 async function saveThresholds(){
-  const vm = parseInt(document.getElementById("in-vm").value);
-  const host = parseInt(document.getElementById("in-host").value);
+  const body = {
+    mode: pendingMode || (lastStatus && lastStatus.thresholds.mode) || "percent",
+    vm_shutdown_pct: num("in-vm"), host_shutdown_pct: num("in-host"),
+    vm_shutdown_min: num("in-vm-min"), host_shutdown_min: num("in-host-min"),
+  };
   const r = await fetch("/api/thresholds", {method:"POST", headers:{"Content-Type":"application/json"},
-                                             body: JSON.stringify({vm_shutdown_pct:vm,host_shutdown_pct:host})});
+                                             body: JSON.stringify(body)});
   if(!r.ok){ alert("save failed: "+await r.text()); return; }
+  thDirty = false;
   refresh();
 }
+document.addEventListener("input", e => {
+  if(["in-vm","in-host","in-vm-min","in-host-min"].includes(e.target.id)){ thDirty = true; renderConversions(); }
+});
 async function resetState(){
   if(!confirm("Reset state to NORMAL? Do this only if you're sure the state file is stale.")) return;
   const r = await fetch("/api/state/reset", {method:"POST"});
@@ -1080,9 +1240,17 @@ async function resetState(){
 }
 async function simulate(){
   const charge = parseInt(document.getElementById("sim-charge").value);
+  let runtime_min = parseFloat(document.getElementById("sim-runtime").value);
+  let est = "";
+  if(isNaN(runtime_min)){
+    const spp = secsPerPct();
+    runtime_min = spp ? Math.round(charge * spp / 6) / 10 : null;
+    est = " (estimated from charge at current load)";
+  }
   const r = await api("/api/simulate", {method:"POST", headers:{"Content-Type":"application/json"},
-                                         body: JSON.stringify({charge,on_battery:true})});
-  let txt = `status=${r.status} charge=${r.charge}% current_state=${r.state}\n`;
+                                         body: JSON.stringify({charge, runtime_min, on_battery:true})});
+  let txt = `status=${r.status} charge=${r.charge}% runtime=${r.runtime_s==null?"unknown":fmtRuntime(r.runtime_s)}${est}\n`;
+  txt += `trigger mode used: ${r.mode_used}   current_state=${r.state}\n`;
   txt += `decision: ${r.action}\n`;
   if(r.detail && r.detail.length){
     for(const d of r.detail){ txt += "  " + JSON.stringify(d) + "\n"; }

@@ -4,6 +4,40 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — Trigger on battery % or runtime, with drain stats
+
+### Added
+
+- **Runtime-based thresholds.** `thresholds.mode` = `percent` (default,
+  unchanged behaviour) or `runtime`. Runtime mode uses `vm_shutdown_min` /
+  `host_shutdown_min`, compared with the UPS's runtime estimate. Both pairs
+  are always stored, so modes can be flipped freely. If the UPS reports no
+  runtime in a given minute, that minute falls back to the % pair.
+- **"Trigger on" switch** in the State machine card, with both threshold
+  pairs editable and an "not saved yet" marker until you save.
+- **"Battery % vs runtime" card**: live charge / runtime / load / watts; a
+  table converting each % threshold to minutes at the current load and each
+  minute threshold to %, previewing unsaved edits; and past outages parsed
+  from the log (duration, charge drop, drain %/min), with the median drain
+  turned into "guest stage after ≈ N min, host stage after ≈ N min, empty
+  after ≈ N min" from a full battery.
+- `GET /api/stats`; `/api/thresholds` accepts `mode` and the minute
+  thresholds; `/api/simulate` accepts `runtime_min` (the UI estimates it
+  from the charge when left blank).
+- CLI: `set-mode percent|runtime`, `set-threshold vm-min|host-min <min>`,
+  `simulate <pct> --runtime <min>`; `status` shows the mode.
+
+### Changed
+
+- The worker now logs one sample line every minute on battery (charge,
+  runtime, load), not only before the guest stage. These lines feed the
+  outage stats.
+- Stage log lines and notification emails name the threshold in the active
+  mode, e.g. "Guest threshold reached (14 min runtime; battery 72%, runtime
+  13m 50s)".
+- The warning email is suppressed once the guest stage is reached, in either
+  mode (previously compared against the % threshold only).
+
 ## [0.4.0] — Daily self-test and worker watchdog
 
 ### Added

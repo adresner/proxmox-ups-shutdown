@@ -10,7 +10,10 @@ Examples:
     ./manage.py disable 10.0.0.21
     ./manage.py set-threshold vm 55
     ./manage.py set-threshold host 15
+    ./manage.py set-threshold vm-min 14   # runtime-mode thresholds (minutes)
+    ./manage.py set-mode runtime          # or: percent
     ./manage.py simulate 45        # dry-run the full logic at a fake charge
+    ./manage.py simulate 45 --runtime 8   # ...with a fake runtime too
     ./manage.py test-ssh           # try `hostname` on every enabled host
     ./manage.py test-ssh 10.0.0.21
     ./manage.py reset-state
@@ -42,8 +45,12 @@ def cmd_status(args) -> int:
     print(f"  runtime:  {ups['_runtime_s']}s")
     print(f"  model:    {ups.get('device.model', '?')}")
     print(f"State:      {state}")
-    print(f"Thresholds: VM<={cfg['thresholds']['vm_shutdown_pct']}%  "
-          f"HOST<={cfg['thresholds']['host_shutdown_pct']}%")
+    th = pmlib.thresholds(cfg)
+    print(f"Trigger:    {th['mode']}"
+          + ("" if pmlib.effective_mode(cfg, ups['_runtime_s']) == th['mode']
+             else "  (UPS reports no runtime; % used)"))
+    print(f"Thresholds: guest <= {th['vm_shutdown_pct']}% / {th['vm_shutdown_min']} min, "
+          f"host <= {th['host_shutdown_pct']}% / {th['host_shutdown_min']} min")
     print(f"Hosts (enabled):")
     for h in pmlib.enabled_hosts(cfg):
         print(f"  - {h.ip:<15s} {h.label}")
@@ -136,14 +143,35 @@ def cmd_disable(args) -> int:
 
 
 def cmd_set_threshold(args) -> int:
+    """vm|host take a battery %; vm-min|host-min take runtime minutes."""
     cfg = pmlib.load_config()
-    key = {"vm": "vm_shutdown_pct", "host": "host_shutdown_pct"}[args.which]
-    cfg["thresholds"][key] = int(args.value)
-    if cfg["thresholds"]["host_shutdown_pct"] >= cfg["thresholds"]["vm_shutdown_pct"]:
-        print("ERROR: host threshold must be lower than VM threshold", file=sys.stderr)
+    key = {"vm": "vm_shutdown_pct", "host": "host_shutdown_pct",
+           "vm-min": "vm_shutdown_min", "host-min": "host_shutdown_min"}[args.which]
+    th = pmlib.thresholds(cfg)
+    th[key] = int(args.value)
+    err = pmlib.validate_thresholds(th)
+    if err:
+        print(f"ERROR: {err}", file=sys.stderr)
         return 1
+    cfg["thresholds"] = th
     pmlib.save_config(cfg)
     print(f"{key} = {args.value}")
+    return 0
+
+
+def cmd_set_mode(args) -> int:
+    """Switch which threshold pair triggers shutdowns: percent or runtime."""
+    cfg = pmlib.load_config()
+    th = pmlib.thresholds(cfg)
+    th["mode"] = args.mode
+    err = pmlib.validate_thresholds(th)
+    if err:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return 1
+    cfg["thresholds"] = th
+    pmlib.save_config(cfg)
+    print(f"trigger mode = {args.mode}  (guest <= {pmlib.stage_label(cfg, 'vm')}, "
+          f"host <= {pmlib.stage_label(cfg, 'host')})")
     return 0
 
 
@@ -152,8 +180,10 @@ def cmd_simulate(args) -> int:
     cfg = pmlib.load_config()
     status = "OB" if args.charge < 100 or args.on_battery else "OL"
     state = pmlib.read_state(cfg)
-    action = pmlib.decide_action(cfg, status, args.charge, state)
-    print(f"Simulated: status={status} charge={args.charge}% state={state}")
+    runtime_s = int(args.runtime * 60) if args.runtime is not None else None
+    action = pmlib.decide_action(cfg, status, args.charge, state, runtime_s=runtime_s)
+    print(f"Simulated: status={status} {pmlib.reading_label(args.charge, runtime_s)} "
+          f"state={state} mode={pmlib.effective_mode(cfg, runtime_s)}")
     print(f"Decision:  {action}")
     if action in ("shutdown_guests", "shutdown_hosts"):
         results = (pmlib.shutdown_guests if action == "shutdown_guests"
@@ -225,12 +255,19 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("disable", help="Disable a host"); d.add_argument("ip"); d.set_defaults(fn=cmd_disable)
 
     st = sub.add_parser("set-threshold", help="Set vm/host threshold percentage")
-    st.add_argument("which", choices=["vm", "host"])
+    st.add_argument("which", choices=["vm", "host", "vm-min", "host-min"],
+                    help="vm/host = battery %%, vm-min/host-min = runtime minutes")
     st.add_argument("value", type=int)
     st.set_defaults(fn=cmd_set_threshold)
 
+    sm = sub.add_parser("set-mode", help="Trigger on battery %% or runtime minutes")
+    sm.add_argument("mode", choices=list(pmlib.THRESHOLD_MODES))
+    sm.set_defaults(fn=cmd_set_mode)
+
     s = sub.add_parser("simulate", help="Dry-run decision logic at a fake charge")
     s.add_argument("charge", type=int)
+    s.add_argument("--runtime", type=float, default=None,
+                   help="Fake runtime in minutes (needed to test runtime mode)")
     s.add_argument("--on-battery", action="store_true",
                    help="Force on-battery status even at 100%")
     s.set_defaults(fn=cmd_simulate)

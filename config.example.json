@@ -2,8 +2,11 @@
   "_comment": "Copy to config.json and edit. Hosts list can be empty to start; add via web UI or `./manage.py add`.",
   "ups_name": "ups-main",
   "thresholds": {
+    "mode": "percent",
     "vm_shutdown_pct": 60,
-    "host_shutdown_pct": 20
+    "host_shutdown_pct": 20,
+    "vm_shutdown_min": 10,
+    "host_shutdown_min": 4
   },
   "ssh": {
     "user": "root",
