@@ -15,6 +15,7 @@ Examples:
     ./manage.py test-ssh 10.0.0.21
     ./manage.py reset-state
     ./manage.py push-key 10.0.0.21   # ssh-copy-id helper
+    ./manage.py forget-key 10.0.0.21 # drop stale host key after a reinstall
 """
 from __future__ import annotations
 
@@ -87,8 +88,21 @@ def cmd_remove(args) -> int:
         print(f"Host {args.ip} not found", file=sys.stderr)
         return 1
     pmlib.save_config(cfg)
-    print(f"Removed {args.ip}")
+    ok, msg = pmlib.forget_host_key(args.ip)
+    print(f"Removed {args.ip} ({msg})")
     return 0
+
+
+def cmd_forget_key(args) -> int:
+    """Forget a host's saved SSH host key (use after reinstalling the host)."""
+    ok, msg = pmlib.forget_host_key(args.ip)
+    print(f"{args.ip}: {msg}")
+    if ok:
+        fp = pmlib.scan_host_fingerprint(args.ip)
+        if fp:
+            print(f"  current host fingerprint: {fp}")
+            print("  next Test SSH / push-key will trust this key")
+    return 0 if ok else 1
 
 
 def _set_enabled(ip: str, value: bool) -> int:
@@ -216,6 +230,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.set_defaults(fn=cmd_test_ssh)
 
     sub.add_parser("reset-state", help="Reset the power_state file to NORMAL").set_defaults(fn=cmd_reset_state)
+
+    fk = sub.add_parser("forget-key", help="Forget a host's saved SSH host key (after reinstall)")
+    fk.add_argument("ip"); fk.set_defaults(fn=cmd_forget_key)
 
     pk = sub.add_parser("push-key", help="ssh-copy-id to a host"); pk.add_argument("ip"); pk.set_defaults(fn=cmd_push_key)
 

@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] — Handle reinstalled hosts (stale SSH host keys)
+
+### Fixed
+
+- **Re-adding a reinstalled host failed with "REMOTE HOST IDENTIFICATION HAS
+  CHANGED".** Removing a host only edited `config.json`; the old host keys
+  stayed in `/root/.ssh/known_hosts`, so SSH (and Push key) refused the
+  rebuilt machine's new keys.
+
+### Added
+
+- **"Reset host key" button** on each host row, `POST
+  /api/host/<ip>/reset-hostkey`, and `manage.py forget-key <ip>`. Forgets the
+  saved key and shows the host's current fingerprint so you can confirm it.
+- **Removing a host now also forgets its saved host key.**
+- **Push key forgets the old host key first.** Typing the host's root
+  password is the explicit "trust this host" step, so the new key is
+  recorded on connect.
+- **Clear error text.** A changed-key failure now says to use Reset host key
+  instead of showing SSH's raw warning banner.
+
+### Unchanged (deliberately)
+
+- The cron worker's shutdown commands still **refuse** a changed host key.
+  Nothing on the outage path auto-trusts a new key, so a spoofed host can't
+  be accepted silently during a power event.
+
+### Docs
+
+- Removed site-specific placeholder text from the web UI form hints.
+
 ## [0.3.0] — Email notifications
 
 ### Added

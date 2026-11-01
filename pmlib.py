@@ -164,6 +164,51 @@ CT_SHUTDOWN_CMD = "pct list | grep running | awk '{print $1}' | xargs -r -I % pc
 HOST_SHUTDOWN_CMD = "shutdown -h now"
 
 
+KNOWN_HOSTS = Path("/root/.ssh/known_hosts")
+_HOSTKEY_CHANGED_MARKERS = ("REMOTE HOST IDENTIFICATION HAS CHANGED",
+                            "Host key verification failed")
+HOSTKEY_CHANGED_HINT = ("host key changed (host was reinstalled?). Click "
+                        "'Reset host key' or run `manage.py forget-key <ip>`, "
+                        "then Test SSH again.")
+
+
+def is_hostkey_changed(err: str) -> bool:
+    return any(m in (err or "") for m in _HOSTKEY_CHANGED_MARKERS)
+
+
+def forget_host_key(ip: str) -> tuple[bool, str]:
+    """Remove every saved host key for `ip` from root's known_hosts.
+
+    Needed when a host is reinstalled (new host keys). Safe to call when no
+    entry exists. Never called automatically from the shutdown path.
+    """
+    if not KNOWN_HOSTS.exists():
+        return True, "no known_hosts file"
+    had = subprocess.run(["ssh-keygen", "-F", ip, "-f", str(KNOWN_HOSTS)],
+                         capture_output=True, text=True).returncode == 0
+    if not had:
+        return True, "no saved key"
+    out = subprocess.run(["ssh-keygen", "-R", ip, "-f", str(KNOWN_HOSTS)],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return False, (out.stderr or out.stdout).strip()
+    return True, "old host key removed"
+
+
+def scan_host_fingerprint(ip: str, timeout: int = 5) -> str:
+    """Return the host's current ed25519 fingerprint (for display), or ''."""
+    try:
+        scan = subprocess.run(["ssh-keyscan", "-T", str(timeout), "-t", "ed25519", ip],
+                              capture_output=True, text=True, timeout=timeout + 5)
+        if not scan.stdout.strip():
+            return ""
+        fp = subprocess.run(["ssh-keygen", "-lf", "-"], input=scan.stdout,
+                            capture_output=True, text=True)
+        return fp.stdout.split()[1] if fp.returncode == 0 and fp.stdout else ""
+    except Exception:
+        return ""
+
+
 def ssh_run(host: Host, cfg: dict, command: str,
             *, dry_run: bool = False, log=None) -> tuple[bool, str]:
     """Run a command on a host via SSH. Returns (ok, output_or_error)."""
@@ -192,6 +237,8 @@ def ssh_run(host: Host, cfg: dict, command: str,
                 log.info(f"OK   {host.label} ({host.ip}): {command}")
             return True, (out.stdout or "ok").strip()
         err = (out.stderr or out.stdout or f"exit {out.returncode}").strip()
+        if is_hostkey_changed(err):
+            err = HOSTKEY_CHANGED_HINT
         if log:
             log.error(f"FAIL {host.label} ({host.ip}): {err}")
         return False, err
@@ -244,6 +291,10 @@ def push_ssh_key(host: Host, cfg: dict, password: str) -> tuple[bool, str]:
         return False, f"missing public key at {pubkey_path}"
     if not password:
         return False, "empty password"
+    # Pushing a key with the root password is the explicit "trust this host"
+    # moment, so drop any stale host key first (e.g. host was reinstalled).
+    # accept-new below then records the host's current key.
+    forget_host_key(host.ip)
     env = os.environ.copy()
     env["SSHPASS"] = password
     args = [
@@ -271,6 +322,8 @@ def push_ssh_key(host: Host, cfg: dict, password: str) -> tuple[bool, str]:
     # sshpass exit codes: 5 = wrong password, 6 = host key verification failed
     if out.returncode == 5:
         return False, "authentication failed (wrong password)"
+    if out.returncode == 6 or is_hostkey_changed(msg):
+        return False, HOSTKEY_CHANGED_HINT
     return False, msg or f"ssh-copy-id exit {out.returncode}"
 
 

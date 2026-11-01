@@ -239,7 +239,8 @@ UI anywhere beyond a trusted LAN.**
   by polling `upsc`. If the verify fails the old config is automatically
   restored. (Driver and SNMP version stay file-only on purpose.)
 - **Hosts table** — toggle enable/disable, per-row "Test SSH" + "Push key" +
-  "Remove". Add-host row with optional one-shot key push.
+  "Reset host key" + "Remove". Reinstalled a host? Click "Reset host key"
+  (or just "Push key", which forgets the old key first). Add-host row with optional one-shot key push.
 - **Simulate** — enter a fake charge %, see exactly which action would fire
   and which SSH commands would be issued. Nothing is actually shut down.
 - **Recent log** — tail of `/var/log/power_monitor.log`.
@@ -256,6 +257,7 @@ Everything the web UI does is also available via `manage.py`:
 | Remove a host | `./manage.py remove 10.0.0.21` |
 | Enable / disable | `./manage.py enable 10.0.0.21` / `disable 10.0.0.21` |
 | Push SSH key (interactive) | `./manage.py push-key 10.0.0.21` |
+| Forget stale host key (after reinstalling a host) | `./manage.py forget-key 10.0.0.21` |
 | Verify SSH | `./manage.py test-ssh` (all) or `./manage.py test-ssh 10.0.0.21` |
 | Change thresholds | `./manage.py set-threshold vm 55` / `set-threshold host 15` |
 | Dry-run at fake charge | `./manage.py simulate 45` |
@@ -304,7 +306,8 @@ Everything the web UI does is also available via `manage.py`:
 | POST   | `/api/host/<ip>/push-key` | yes | `{password}` — `sshpass + ssh-copy-id`; password via env var, never logged |
 | POST   | `/api/host` | yes | Add: `{ip, label, note, enabled}` |
 | PATCH  | `/api/host/<ip>` | yes | `{enabled, label, note}` |
-| DELETE | `/api/host/<ip>` | yes | |
+| DELETE | `/api/host/<ip>` | yes | Also forgets the host's saved SSH host key |
+| POST   | `/api/host/<ip>/reset-hostkey` | yes | Forget saved host key (after a reinstall); returns current fingerprint |
 | POST   | `/api/thresholds` | yes | `{vm_shutdown_pct, host_shutdown_pct}` |
 | POST   | `/api/state/reset` | yes | Force state → `NORMAL` |
 

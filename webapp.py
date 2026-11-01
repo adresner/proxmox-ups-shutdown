@@ -291,7 +291,17 @@ def api_host_delete(ip):
     if len(cfg["hosts"]) == before:
         return jsonify({"error": "not found"}), 404
     pmlib.save_config(cfg)
+    pmlib.forget_host_key(ip)
     return jsonify({"ok": True})
+
+
+@app.route("/api/host/<ip>/reset-hostkey", methods=["POST"])
+@requires_auth
+def api_reset_hostkey(ip):
+    """Forget the saved SSH host key for ip (after a reinstall)."""
+    ok, msg = pmlib.forget_host_key(ip)
+    fp = pmlib.scan_host_fingerprint(ip) if ok else ""
+    return jsonify({"ok": ok, "msg": msg, "fingerprint": fp}), (200 if ok else 500)
 
 
 @app.route("/api/host/<ip>", methods=["PATCH"])
@@ -663,6 +673,7 @@ async function refresh(){
       <td class="row-actions">
         <button class="ghost" onclick="testOne('${ip}')">Test SSH</button>
         <button class="ghost" onclick="pushKey('${ip}','${label||ip}')">Push key</button>
+        <button class="ghost" title="Forget saved SSH host key (use after reinstalling this host)" onclick="resetHostKey('${ip}','${label||ip}')">Reset host key</button>
         <button class="danger" onclick="removeHost('${ip}')">Remove</button>
       </td>`;
     tbody.appendChild(tr);
@@ -850,6 +861,14 @@ async function pushKey(ip, label){
     modalSetMsg("✗ " + (data.msg || "failed"), true);
     document.getElementById("modal-ok").disabled = false;
   }
+}
+async function resetHostKey(ip, label){
+  if(!confirm("Forget the saved SSH host key for "+label+" ("+ip+")?\n\nOnly do this if you reinstalled the host. The next SSH connection will trust whatever key it presents.")) return;
+  const r = await fetch("/api/host/"+ip+"/reset-hostkey", {method:"POST"});
+  if(r.status === 401){ window.location = "/login"; return; }
+  const d = await r.json().catch(()=>({ok:false,msg:"bad response"}));
+  if(!d.ok){ alert("reset failed: "+d.msg); return; }
+  alert(label+": "+d.msg+(d.fingerprint ? "\n\nHost's current fingerprint:\n"+d.fingerprint+"\n\nNow click Test SSH (or Push key on a fresh install)." : "\n\n(host not reachable to read its fingerprint)"));
 }
 async function removeHost(ip){
   if(!confirm("Remove "+ip+" from config?")) return;
