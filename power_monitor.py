@@ -30,7 +30,9 @@ def main() -> int:
     status = ups.get("ups.status", "")
     charge = ups["_charge"]
     state = pmlib.read_state(cfg)
-    action = pmlib.decide_action(cfg, status, charge, state)
+    retry_ips = pmlib.read_guest_retry(cfg)
+    action = pmlib.decide_action(cfg, status, charge, state,
+                                 guest_retry_pending=bool(retry_ips))
 
     # Warning email — fires once per outage when battery first drops below
     # warning_pct, regardless of whether the next stage has been reached yet.
@@ -57,10 +59,29 @@ def main() -> int:
             f"Battery {charge}% <= {cfg['thresholds']['vm_shutdown_pct']}%. "
             f"Shutting down GUESTS. (dry_run={dry_run})"
         )
-        pmlib.shutdown_guests(cfg, dry_run=dry_run, log=log)
+        results = pmlib.shutdown_guests(cfg, dry_run=dry_run, log=log)
+        failed = [r["host"] for r in results if not r["ok"]]
+        if failed:
+            log.warning(f"Guest shutdown failed on {', '.join(failed)}; "
+                        f"will retry every minute until the host stage.")
         if not dry_run:
-            pmlib.write_state(cfg, pmlib.GUESTS_DOWN)
+            pmlib.write_state(cfg, pmlib.GUESTS_DOWN, guest_retry=failed)
         pmlib.notify_event(cfg, "guests_shutdown", ups, dry_run=dry_run, log=log)
+        return 0
+
+    if action == "retry_guests":
+        log.warning(f"Retrying guest shutdown on {', '.join(retry_ips)} "
+                    f"(charge {charge}%, dry_run={dry_run})")
+        results = pmlib.shutdown_guests(cfg, dry_run=dry_run, log=log,
+                                        only_ips=retry_ips)
+        # Hosts removed/disabled since the last attempt drop out naturally.
+        still = [r["host"] for r in results if not r["ok"]]
+        if still:
+            log.warning(f"Guest shutdown still failing on {', '.join(still)}")
+        else:
+            log.info("Guest shutdown retry succeeded on all pending hosts.")
+        if not dry_run:
+            pmlib.write_state(cfg, pmlib.GUESTS_DOWN, guest_retry=still)
         return 0
 
     if action == "shutdown_hosts":

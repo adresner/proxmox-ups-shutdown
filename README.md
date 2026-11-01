@@ -121,16 +121,23 @@ current state file value:
 | `OL` (online) | any | If state ≠ NORMAL → reset to NORMAL ("Power Restored") |
 | `OB` / `LB` (on battery) | > `vm_shutdown_pct` | noop (logged once on the OB → battery transition) |
 | `OB` / `LB` | `host_pct < c ≤ vm_pct` | Shut down all guests on each enabled host; state → `GUESTS_DOWN` |
+| `OB` / `LB` | `> host_pct`, state `GUESTS_DOWN` | Retry the guest stage on hosts whose last attempt failed (unreachable, timeout) |
 | `OB` / `LB` | ≤ `host_shutdown_pct` | `shutdown -h now` on each enabled host; state → `HOSTS_DOWN` |
 
 Each stage runs **once** per outage (gated on `/var/run/power_state`) so the
-1-minute cron doesn't spam shutdown requests.
+1-minute cron doesn't spam shutdown requests. The one exception: if a host's
+guest-shutdown SSH fails, that host (and only that host) is retried every
+minute until it succeeds or the host stage fires.
 
-Per-host commands fired over SSH (only against `enabled: true` hosts):
+All hosts are contacted in parallel. Per-host commands fired over SSH (only
+against `enabled: true` hosts):
 
 ```sh
-qm  list | grep running | awk '{print $1}' | xargs -r -I % qm  shutdown %
-pct list | grep running | awk '{print $1}' | xargs -r -I % pct shutdown %
+# Each guest shutdown is started detached (setsid -f), so the SSH call returns
+# in about a second and every guest on the host shuts down in parallel. A slow
+# guest (e.g. Windows) can't hold up the others or trip the SSH timeout.
+for id in $(qm  list | awk 'NR>1 && $3=="running" {print $1}'); do setsid -f qm  shutdown $id ...; done
+for id in $(pct list | awk 'NR>1 && $2=="running" {print $1}'); do setsid -f pct shutdown $id ...; done
 shutdown -h now
 ```
 

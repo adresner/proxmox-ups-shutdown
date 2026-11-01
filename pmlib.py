@@ -15,6 +15,7 @@ import socket
 import ssl
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
@@ -136,13 +137,28 @@ def read_state(cfg: dict) -> str:
     return _read_state_blob(cfg)["state"]
 
 
-def write_state(cfg: dict, value: str) -> None:
-    """Update state value; clear the 'sent' notification list when returning to NORMAL."""
+def write_state(cfg: dict, value: str, *,
+                guest_retry: list[str] | None = None) -> None:
+    """Update state value.
+
+    Returning to NORMAL clears the 'sent' notification list. `guest_retry`
+    (IPs whose guest-shutdown SSH failed) is stored only while GUESTS_DOWN;
+    any other state clears it.
+    """
     data = _read_state_blob(cfg)
     data["state"] = value
     if value == NORMAL:
         data["sent"] = []
+    if value == GUESTS_DOWN and guest_retry is not None:
+        data["guest_retry"] = list(guest_retry)
+    elif value != GUESTS_DOWN:
+        data.pop("guest_retry", None)
     _write_state_blob(cfg, data)
+
+
+def read_guest_retry(cfg: dict) -> list[str]:
+    """Hosts whose guest shutdown failed and should be retried next tick."""
+    return list(_read_state_blob(cfg).get("guest_retry", []))
 
 
 def has_notified(cfg: dict, event: str) -> bool:
@@ -159,8 +175,22 @@ def mark_notified(cfg: dict, event: str) -> None:
 
 # --- SSH / shutdown --------------------------------------------------------
 
-VM_SHUTDOWN_CMD = "qm list | grep running | awk '{print $1}' | xargs -r -I % qm shutdown %"
-CT_SHUTDOWN_CMD = "pct list | grep running | awk '{print $1}' | xargs -r -I % pct shutdown %"
+# Guest shutdowns are fired *detached* (setsid -f) so the SSH call returns in
+# about a second. The old form (`xargs qm shutdown`) waited for each guest to
+# stop, one after another; a slow Windows VM pushed it past the SSH timeout,
+# the session was killed, and the remaining guests on that host were skipped
+# (seen in a real outage as exit 124 on two hosts). Detached, each
+# `qm/pct shutdown` keeps running on the host after SSH disconnects, and all
+# guests on a host shut down in parallel. Output lists the IDs started.
+# qm list columns: VMID NAME STATUS ...   pct list columns: VMID Status Lock Name
+VM_SHUTDOWN_CMD = (
+    "for id in $(qm list | awk 'NR>1 && $3==\"running\" {print $1}'); do "
+    "setsid -f qm shutdown $id </dev/null >/dev/null 2>&1; echo vm:$id; done; "
+    "echo started")
+CT_SHUTDOWN_CMD = (
+    "for id in $(pct list | awk 'NR>1 && $2==\"running\" {print $1}'); do "
+    "setsid -f pct shutdown $id </dev/null >/dev/null 2>&1; echo ct:$id; done; "
+    "echo started")
 HOST_SHUTDOWN_CMD = "shutdown -h now"
 
 
@@ -252,24 +282,37 @@ def ssh_run(host: Host, cfg: dict, command: str,
         return False, str(e)
 
 
-def shutdown_guests(cfg: dict, *, dry_run: bool = False, log=None) -> list[dict]:
-    results = []
-    for host in enabled_hosts(cfg):
+def _parallel(hosts: list[Host], fn) -> list[dict]:
+    """Run fn(host) for every host concurrently; results keep host order."""
+    if not hosts:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(hosts))) as pool:
+        return list(pool.map(fn, hosts))
+
+
+def shutdown_guests(cfg: dict, *, dry_run: bool = False, log=None,
+                    only_ips: list[str] | None = None) -> list[dict]:
+    """Ask every enabled host (or just `only_ips`) to shut down its guests."""
+    hosts = [h for h in enabled_hosts(cfg)
+             if only_ips is None or h.ip in only_ips]
+
+    def one(host: Host) -> dict:
         ok_vm, msg_vm = ssh_run(host, cfg, VM_SHUTDOWN_CMD, dry_run=dry_run, log=log)
         ok_ct, msg_ct = ssh_run(host, cfg, CT_SHUTDOWN_CMD, dry_run=dry_run, log=log)
-        results.append({"host": host.ip, "label": host.label,
-                        "vm": {"ok": ok_vm, "msg": msg_vm},
-                        "ct": {"ok": ok_ct, "msg": msg_ct}})
-    return results
+        return {"host": host.ip, "label": host.label,
+                "ok": ok_vm and ok_ct,
+                "vm": {"ok": ok_vm, "msg": msg_vm},
+                "ct": {"ok": ok_ct, "msg": msg_ct}}
+
+    return _parallel(hosts, one)
 
 
 def shutdown_hosts(cfg: dict, *, dry_run: bool = False, log=None) -> list[dict]:
-    results = []
-    for host in enabled_hosts(cfg):
+    def one(host: Host) -> dict:
         ok, msg = ssh_run(host, cfg, HOST_SHUTDOWN_CMD, dry_run=dry_run, log=log)
-        results.append({"host": host.ip, "label": host.label,
-                        "ok": ok, "msg": msg})
-    return results
+        return {"host": host.ip, "label": host.label, "ok": ok, "msg": msg}
+
+    return _parallel(enabled_hosts(cfg), one)
 
 
 def test_ssh(host: Host, cfg: dict) -> tuple[bool, str]:
@@ -329,9 +372,14 @@ def push_ssh_key(host: Host, cfg: dict, password: str) -> tuple[bool, str]:
 
 # --- Decision logic --------------------------------------------------------
 
-def decide_action(cfg: dict, status: str, charge: int, current_state: str) -> str:
+def decide_action(cfg: dict, status: str, charge: int, current_state: str,
+                  guest_retry_pending: bool = False) -> str:
     """Pure function: given UPS status + charge + current state, return one of
-    'noop', 'shutdown_guests', 'shutdown_hosts', 'reset_normal'.
+    'noop', 'shutdown_guests', 'retry_guests', 'shutdown_hosts', 'reset_normal'.
+
+    'retry_guests' re-runs the guest stage only on hosts whose previous
+    attempt failed (unreachable, timeout), every tick while still on battery
+    and above the host threshold.
     """
     th = cfg["thresholds"]
     vm_pct = th["vm_shutdown_pct"]
@@ -347,6 +395,9 @@ def decide_action(cfg: dict, status: str, charge: int, current_state: str) -> st
             return "shutdown_hosts"
         if host_pct < charge <= vm_pct and current_state == NORMAL:
             return "shutdown_guests"
+        if (charge > host_pct and current_state == GUESTS_DOWN
+                and guest_retry_pending):
+            return "retry_guests"
 
     return "noop"
 

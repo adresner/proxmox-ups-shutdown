@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] — Reliable guest shutdown on hosts with many or slow VMs
+
+### Fixed
+
+- **Guest shutdown could stop partway on a host.** The guest stage ran
+  `xargs qm shutdown`, which waits for each guest to fully stop before
+  starting the next. With several guests, or one slow Windows VM, it ran past
+  the SSH timeout; the session was killed and the remaining guests on that
+  host were never asked to shut down. Seen in a real outage as `exit 124`.
+  Guest shutdowns are now started detached (`setsid -f`) on the host, so SSH
+  returns in about a second and all guests shut down in parallel.
+
+### Added
+
+- **Retry for failed hosts.** If a host's guest-shutdown SSH fails
+  (unreachable, timeout), the host is recorded in the state file
+  (`guest_retry`) and retried every minute until it succeeds or the host
+  stage fires. Other hosts are not re-contacted. New `decide_action` result:
+  `retry_guests`.
+- **Hosts are contacted in parallel** in both the guest and host stages, so
+  one slow or unreachable host no longer delays the rest.
+
 ## [0.3.1] — Handle reinstalled hosts (stale SSH host keys)
 
 ### Fixed
