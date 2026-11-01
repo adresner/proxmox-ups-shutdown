@@ -14,6 +14,7 @@ Examples:
     ./manage.py test-ssh           # try `hostname` on every enabled host
     ./manage.py test-ssh 10.0.0.21
     ./manage.py reset-state
+    ./manage.py self-test          # UPS, SSH+qm/pct, SMTP, cron worker
     ./manage.py push-key 10.0.0.21   # ssh-copy-id helper
     ./manage.py forget-key 10.0.0.21 # drop stale host key after a reinstall
 """
@@ -103,6 +104,15 @@ def cmd_forget_key(args) -> int:
             print(f"  current host fingerprint: {fp}")
             print("  next Test SSH / push-key will trust this key")
     return 0 if ok else 1
+
+
+def cmd_self_test(args) -> int:
+    """Run the self-test now (read-only) and print the result. No email."""
+    cfg = pmlib.load_config()
+    result = pmlib.run_selftest(cfg, trigger="manual (CLI)")
+    pmlib.save_selftest(cfg, result)
+    print(pmlib.format_selftest(result))
+    return 0 if result["ok"] else 1
 
 
 def _set_enabled(ip: str, value: bool) -> int:
@@ -230,6 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.set_defaults(fn=cmd_test_ssh)
 
     sub.add_parser("reset-state", help="Reset the power_state file to NORMAL").set_defaults(fn=cmd_reset_state)
+    sub.add_parser("self-test", help="Check UPS, SSH+qm/pct on every host, SMTP, cron worker").set_defaults(fn=cmd_self_test)
 
     fk = sub.add_parser("forget-key", help="Forget a host's saved SSH host key (after reinstall)")
     fk.add_argument("ip"); fk.set_defaults(fn=cmd_forget_key)

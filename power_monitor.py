@@ -20,6 +20,11 @@ def main() -> int:
     cfg = pmlib.load_config()
     log = pmlib.get_logger(cfg)
     dry_run = os.environ.get("DRY_RUN") == "1"
+    if not dry_run:
+        try:
+            pmlib.write_heartbeat(cfg)  # read by the self-test and web watchdog
+        except OSError as e:
+            log.error(f"could not write heartbeat: {e}")
 
     try:
         ups = pmlib.read_ups(cfg["ups_name"])
@@ -98,5 +103,20 @@ def main() -> int:
     return 0
 
 
+def scheduled_selftest() -> None:
+    """Daily self-test, run *after* main() so it can never delay or break the
+    shutdown decision for this tick. Skipped entirely under DRY_RUN."""
+    if os.environ.get("DRY_RUN") == "1":
+        return
+    cfg = pmlib.load_config()
+    log = pmlib.get_logger(cfg)
+    try:
+        pmlib.maybe_run_scheduled_selftest(cfg, log=log)
+    except Exception as e:
+        log.error(f"self-test crashed: {type(e).__name__}: {e}")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    scheduled_selftest()
+    sys.exit(rc)

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import functools
 import os
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from flask import (
@@ -126,7 +128,92 @@ def api_status():
         "ups_name": cfg["ups_name"],
         "hosts": [h for h in cfg["hosts"]],
         "log_tail": pmlib.tail_log(cfg, lines=30),
+        "worker_age_s": pmlib.heartbeat_age(cfg),
+        "worker_stale_s": pmlib.WORKER_STALE_S,
+        "selftest_ok": (pmlib.load_selftest(cfg) or {}).get("ok"),
     })
+
+
+# --- Self-test -------------------------------------------------------------
+
+@app.route("/api/selftest", methods=["GET"])
+@requires_auth
+def api_selftest_get():
+    cfg = pmlib.load_config()
+    return jsonify({
+        "config": pmlib.selftest_cfg(cfg),
+        "last": pmlib.load_selftest(cfg),
+        "server_time": time.strftime("%H:%M"),
+        "server_tz": time.strftime("%Z"),
+        "worker_age_s": pmlib.heartbeat_age(cfg),
+    })
+
+
+@app.route("/api/selftest/config", methods=["POST"])
+@requires_auth
+def api_selftest_config():
+    cfg = pmlib.load_config()
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        hour = int(data.get("hour", 7))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "hour must be an integer"}), 400
+    if not 0 <= hour <= 23:
+        return jsonify({"ok": False, "msg": "hour must be 0-23"}), 400
+    cfg["selftest"] = {
+        "enabled": bool(data.get("enabled", True)),
+        "hour": hour,
+        "email_on_success": bool(data.get("email_on_success", False)),
+    }
+    pmlib.save_config(cfg)
+    return jsonify({"ok": True, "msg": "saved"})
+
+
+@app.route("/api/selftest/run", methods=["POST"])
+@requires_auth
+def api_selftest_run():
+    """Run the self-test now. Read-only checks; never emails (you're watching)."""
+    cfg = pmlib.load_config()
+    result = pmlib.run_selftest(cfg, trigger="manual")
+    pmlib.save_selftest(cfg, result)
+    return jsonify(result)
+
+
+def _worker_watchdog() -> None:
+    """Email if the cron worker stops running. Runs in the web process because
+    a dead worker can't report on itself. One alert per episode, plus a
+    recovery email."""
+    started = time.time()
+    alerted = False
+    while True:
+        time.sleep(60)
+        try:
+            cfg = pmlib.load_config()
+            if not pmlib.selftest_cfg(cfg)["enabled"]:
+                continue
+            age = pmlib.heartbeat_age(cfg)
+            # After a reboot /var/run is empty; give the worker time to tick.
+            stale = (age is None and time.time() - started > pmlib.WORKER_STALE_S) \
+                or (age is not None and age > pmlib.WORKER_STALE_S)
+            log = pmlib.get_logger(cfg)
+            if stale and not alerted:
+                what = "has never run since boot" if age is None else f"last ran {age // 60} min ago"
+                ok, msg = pmlib.send_email(
+                    cfg, "[nutshutdown] WORKER NOT RUNNING: no UPS monitoring",
+                    f"The power_monitor.py cron worker {what}.\n\nWhile it is "
+                    f"stopped, a power outage will NOT trigger any shutdowns.\n"
+                    f"Check `crontab -l` and run `/usr/bin/python3 "
+                    f"/root/power_monitor.py` by hand to see the error.\n")
+                log.error(f"WATCHDOG: worker {what}; alert email "
+                          f"{'sent' if ok else 'FAILED: ' + msg}")
+                alerted = ok
+            elif not stale and alerted:
+                pmlib.send_email(cfg, "[nutshutdown] Worker running again",
+                                 f"The cron worker is running again (last ran {age}s ago).\n")
+                log.info("WATCHDOG: worker running again")
+                alerted = False
+        except Exception:
+            pass  # never let the watchdog take the web UI down
 
 
 @app.route("/api/simulate", methods=["POST"])
@@ -394,6 +481,8 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
   <h1>nutserver — Proxmox graceful-shutdown orchestrator</h1>
   <span id="ups-pill" class="pill">…</span>
   <span id="state-pill" class="pill warn">…</span>
+  <span id="worker-pill" class="pill" title="When the every-minute cron worker last ran">…</span>
+  <span id="selftest-pill" class="pill" title="Result of the last self-test">…</span>
   <span style="flex:1"></span>
   <button class="ghost" onclick="refresh()">Refresh</button>
   <form method="POST" action="/logout" style="margin:0">
@@ -431,6 +520,39 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
     <p class="muted" style="margin:8px 0 0 0;font-size:12px">
       Host % must be lower than VM %. Reset only if you know the state file is stale.
     </p>
+  </section>
+
+  <section class="card" style="grid-column:1 / -1">
+    <h2>Self-test</h2>
+    <p class="muted" style="margin:0 0 10px 0;font-size:12px">
+      Checks everything a power outage depends on: the UPS is readable, every
+      enabled host accepts SSH and can run <code>qm</code>/<code>pct</code>, the
+      email relay answers, and the cron worker is alive. Read-only; nothing is
+      shut down. The daily run emails you on failure (every day until fixed) and
+      once on recovery. Separately, the web app emails you if the cron worker
+      stops for 10 minutes.
+    </p>
+    <div class="row" style="gap:12px">
+      <span id="st-summary" class="muted">no self-test has run yet</span>
+      <span style="flex:1"></span>
+      <button id="st-run-btn" onclick="runSelftest()">Run self-test now</button>
+    </div>
+    <table id="st-table" style="margin-top:8px"><tbody></tbody></table>
+    <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
+    <div class="row" style="gap:16px">
+      <label class="muted" style="font-size:13px;display:flex;align-items:center;gap:4px">
+        <input id="st-enabled" type="checkbox"> Daily self-test + worker watchdog
+      </label>
+      <label class="muted" style="font-size:13px">Run daily at
+        <input id="st-hour" type="number" min="0" max="23" style="width:60px">:00
+        <span id="st-clock" style="font-size:12px"></span>
+      </label>
+      <label class="muted" style="font-size:13px;display:flex;align-items:center;gap:4px">
+        <input id="st-success" type="checkbox"> Also email when everything passes
+      </label>
+      <button id="st-save-btn" onclick="saveSelftestConfig()">Save</button>
+    </div>
+    <p id="st-msg" class="muted" style="font-size:12px;margin:8px 0 0 0;min-height:1em"></p>
   </section>
 
   <section class="card" style="grid-column:1 / -1">
@@ -572,7 +694,7 @@ pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:6px;paddin
   </section>
 </div>
 
-<div class="foot">Edits prompt for HTTP basic auth (see <code>web.username/password</code> in <code>config.json</code>).</div>
+<div class="foot">Login credentials: <code>web.username/password</code> in <code>config.json</code>. API endpoints also accept HTTP Basic Auth.</div>
 
 <div id="modal-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center">
   <div style="background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:20px;min-width:360px;max-width:480px">
@@ -658,6 +780,17 @@ async function refresh(){
   statePill.className = "pill " + (s.state==="NORMAL"?"ok":
                                    s.state==="HOSTS_DOWN"?"bad":"warn");
 
+  const wp = document.getElementById("worker-pill");
+  const wa = s.worker_age_s;
+  const wStale = wa === null || wa > s.worker_stale_s;
+  wp.textContent = wa === null ? "worker: no heartbeat" :
+                   "worker " + (wa < 120 ? wa + "s" : Math.floor(wa/60) + "m") + " ago";
+  wp.className = "pill " + (wStale ? "bad" : "ok");
+  const sp = document.getElementById("selftest-pill");
+  sp.textContent = s.selftest_ok === true ? "self-test OK" :
+                   s.selftest_ok === false ? "SELF-TEST FAILED" : "self-test: never run";
+  sp.className = "pill " + (s.selftest_ok === true ? "ok" : s.selftest_ok === false ? "bad" : "warn");
+
   const tbody = document.querySelector("#hosts-table tbody");
   tbody.innerHTML = "";
   for(const h of s.hosts){
@@ -685,6 +818,18 @@ async function refresh(){
   const focusId = document.activeElement && document.activeElement.id || "";
   const isUpsFocus = focusId.startsWith("ups-") && document.activeElement.tagName === "INPUT";
   const isNFocus = focusId.startsWith("n-") && document.activeElement.tagName === "INPUT";
+  const isStFocus = focusId.startsWith("st-") && document.activeElement.tagName === "INPUT";
+  try {
+    const st = await api("/api/selftest");
+    renderSelftest(st.last);
+    document.getElementById("st-clock").textContent =
+      `(server clock ${st.server_tz}, now ${st.server_time})`;
+    if(!isStFocus){
+      document.getElementById("st-enabled").checked = !!st.config.enabled;
+      document.getElementById("st-hour").value = st.config.hour;
+      document.getElementById("st-success").checked = !!st.config.email_on_success;
+    }
+  } catch(e){ /* ignore */ }
   if(!isUpsFocus){
     try {
       const u = await api("/api/ups/config");
@@ -713,6 +858,49 @@ async function refresh(){
       document.getElementById("n-ev-restored").checked = !!n.events.power_restored;
     } catch(e){ /* ignore */ }
   }
+}
+
+function renderSelftest(r){
+  const sum = document.getElementById("st-summary");
+  const tbody = document.querySelector("#st-table tbody");
+  if(!r){ sum.textContent = "no self-test has run yet"; tbody.innerHTML = ""; return; }
+  sum.innerHTML = `<span class="pill ${r.ok?"ok":"bad"}">${r.ok?"PASSED":"FAILED"}</span>
+    <span class="muted" style="margin-left:6px">${esc(r.time)} (${esc(r.trigger)})</span>`;
+  tbody.innerHTML = r.checks.map(c => `<tr>
+      <td style="width:28px">${c.ok ? "<span style='color:var(--ok)'>✓</span>"
+                                    : "<span style='color:var(--bad)'>✗</span>"}</td>
+      <td style="width:160px">${esc(c.name)}</td>
+      <td class="${c.ok?"muted":""}">${esc(c.msg)}</td></tr>`).join("");
+}
+
+async function runSelftest(){
+  const btn = document.getElementById("st-run-btn");
+  const msg = document.getElementById("st-msg");
+  btn.disabled = true; msg.textContent = "running self-test …"; msg.style.color = "var(--muted)";
+  try {
+    const r = await api("/api/selftest/run", {method:"POST"});
+    renderSelftest(r);
+    msg.textContent = r.ok ? "all checks passed" : "some checks failed (see above)";
+    msg.style.color = r.ok ? "var(--ok)" : "var(--bad)";
+  } catch(e){
+    msg.textContent = "self-test request failed: " + e.message; msg.style.color = "var(--bad)";
+  }
+  btn.disabled = false;
+  refresh();
+}
+
+async function saveSelftestConfig(){
+  const msg = document.getElementById("st-msg");
+  const body = {
+    enabled: document.getElementById("st-enabled").checked,
+    hour: parseInt(document.getElementById("st-hour").value),
+    email_on_success: document.getElementById("st-success").checked,
+  };
+  const r = await fetch("/api/selftest/config", {method:"POST",
+    headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  const data = await r.json().catch(()=>({ok:false,msg:"bad response"}));
+  msg.textContent = (data.ok ? "saved" : "save failed: ") + (data.msg || "");
+  msg.style.color = data.ok ? "var(--ok)" : "var(--bad)";
 }
 
 async function saveNotifications(){
@@ -961,5 +1149,7 @@ button{margin-top:18px;background:var(--accent);color:#03142e;border:0;border-ra
 if __name__ == "__main__":
     cfg = pmlib.load_config()
     web = cfg.get("web", {})
+    threading.Thread(target=_worker_watchdog, name="worker-watchdog",
+                     daemon=True).start()
     app.run(host=web.get("bind", "0.0.0.0"), port=int(web.get("port", 8080)),
             debug=False)

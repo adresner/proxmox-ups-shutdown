@@ -49,5 +49,10 @@
       "hosts_shutdown": true,
       "power_restored": true
     }
+  },
+  "selftest": {
+    "enabled": true,
+    "hour": 7,
+    "email_on_success": false
   }
 }

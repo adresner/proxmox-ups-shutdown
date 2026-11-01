@@ -810,3 +810,231 @@ def tail_log(cfg: dict, lines: int = 50) -> list[str]:
             f.seek(size)
             data = f.read(step) + data
     return data.decode("utf-8", errors="replace").splitlines()[-lines:]
+
+
+# --- Self-test + worker heartbeat ------------------------------------------
+#
+# A daily check that everything an outage depends on still works: the UPS is
+# readable, every enabled host accepts SSH *and* can run qm/pct, the SMTP
+# relay answers, and the cron worker is alive. Failures are emailed (once per
+# scheduled run, i.e. daily until fixed) and a recovery email is sent when a
+# failing self-test passes again. Nothing here shuts anything down.
+
+SELFTEST_DEFAULTS = {"enabled": True, "hour": 7, "email_on_success": False}
+WORKER_STALE_S = 600   # worker heartbeat older than this = worker not running
+SELFTEST_HOST_CMD = "hostname && qm list >/dev/null && pct list >/dev/null && echo pve-ok"
+
+
+def selftest_cfg(cfg: dict) -> dict:
+    return {**SELFTEST_DEFAULTS, **(cfg.get("selftest") or {})}
+
+
+def _heartbeat_path(cfg: dict) -> Path:
+    return Path(cfg["paths"].get("heartbeat_file", "/var/run/power_monitor.heartbeat"))
+
+
+def _selftest_path(cfg: dict) -> Path:
+    return Path(cfg["paths"].get("selftest_file",
+                                 str(CONFIG_PATH.parent / "selftest_last.json")))
+
+
+def write_heartbeat(cfg: dict) -> None:
+    """Called by the cron worker on every tick (not in DRY_RUN)."""
+    _heartbeat_path(cfg).write_text(str(int(time.time())))
+
+
+def heartbeat_age(cfg: dict) -> int | None:
+    """Seconds since the worker last ran, or None if it never has (since boot)."""
+    try:
+        return int(time.time()) - int(_heartbeat_path(cfg).read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def load_selftest(cfg: dict) -> dict | None:
+    try:
+        return json.loads(_selftest_path(cfg).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def save_selftest(cfg: dict, result: dict) -> None:
+    path = _selftest_path(cfg)
+    if "last_scheduled_date" not in result:
+        # A manual run must not reset "already ran today's scheduled test".
+        prev = load_selftest(cfg) or {}
+        if prev.get("last_scheduled_date"):
+            result["last_scheduled_date"] = prev["last_scheduled_date"]
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(result, indent=2))
+    os.replace(tmp, path)
+
+
+def check_smtp(cfg: dict) -> tuple[bool, str]:
+    """Connect to the configured SMTP server and say hello. Sends nothing."""
+    notif = cfg.get("notifications", {}) or {}
+    host = (notif.get("smtp_host") or "").strip()
+    if not host:
+        return True, "email not configured (skipped); self-test results only show in the web UI"
+    port = int(notif.get("smtp_port") or 25)
+    use_tls = bool(notif.get("smtp_use_tls"))
+    user = (notif.get("smtp_user") or "").strip()
+    tls_ctx = ssl.create_default_context()
+    tls_ctx.check_hostname = False
+    tls_ctx.verify_mode = ssl.CERT_NONE
+    try:
+        if use_tls and port == 465:
+            client = smtplib.SMTP_SSL(host, port, timeout=10, context=tls_ctx)
+        else:
+            client = smtplib.SMTP(host, port, timeout=10)
+            if use_tls:
+                client.starttls(context=tls_ctx)
+        try:
+            code, _ = client.ehlo()
+            if user:
+                client.login(user, notif.get("smtp_password") or "")
+            code, _ = client.noop()
+        finally:
+            try: client.quit()
+            except Exception: pass
+        if code != 250:
+            return False, f"{host}:{port} answered {code} to NOOP"
+        return True, f"{host}:{port} reachable" + (" (login ok)" if user else "")
+    except smtplib.SMTPAuthenticationError as e:
+        return False, f"{host}:{port} login failed: {e}"
+    except (smtplib.SMTPException, OSError) as e:
+        return False, f"{host}:{port} unreachable: {type(e).__name__}: {e}"
+
+
+def run_selftest(cfg: dict, *, trigger: str = "manual") -> dict:
+    """Run every check and return a result dict. Read-only on all hosts."""
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool, msg: str) -> None:
+        checks.append({"name": name, "ok": bool(ok), "msg": msg})
+
+    # 1. UPS
+    try:
+        ups = read_ups(cfg["ups_name"])
+        status = ups.get("ups.status", "")
+        charge, runtime = ups["_charge"], ups["_runtime_s"]
+        detail = f"status {status}, charge {charge}%, runtime {runtime // 60}m"
+        if "RB" in status.split():
+            add("UPS", False, f"UPS reports REPLACE BATTERY ({detail})")
+        elif "OL" not in status.split():
+            add("UPS", False, f"not on mains power ({detail})")
+        else:
+            add("UPS", True, detail)
+    except Exception as e:
+        add("UPS", False, f"cannot read UPS via upsc: {e}")
+
+    # 2. Hosts: SSH + qm/pct usable (exactly what the shutdown path needs)
+    hosts = enabled_hosts(cfg)
+    if not hosts:
+        add("Hosts", False, "no hosts are enabled; nothing would be shut down")
+
+    def one(h: Host) -> dict:
+        ok, msg = ssh_run(h, cfg, SELFTEST_HOST_CMD)
+        if ok and "pve-ok" in msg:
+            name = msg.splitlines()[0] if msg else h.label
+            return {"name": f"Host {h.label}", "ok": True,
+                    "msg": f"{h.ip}: SSH ok (hostname {name}), qm/pct ok"}
+        if ok:
+            return {"name": f"Host {h.label}", "ok": False,
+                    "msg": f"{h.ip}: SSH ok but qm/pct failed: {msg}"}
+        return {"name": f"Host {h.label}", "ok": False, "msg": f"{h.ip}: {msg}"}
+
+    checks.extend(_parallel(hosts, one))
+
+    # 3. Email relay
+    ok, msg = check_smtp(cfg)
+    add("Email relay", ok, msg)
+
+    # 4. Cron worker heartbeat
+    age = heartbeat_age(cfg)
+    if age is None:
+        add("Cron worker", False, "no heartbeat yet; is the cron entry for power_monitor.py installed?")
+    elif age > WORKER_STALE_S:
+        add("Cron worker", False, f"last ran {age // 60} min ago; cron or the worker is broken")
+    else:
+        add("Cron worker", True, f"last ran {age}s ago")
+
+    now = time.time()
+    return {
+        "ts": int(now),
+        "time": time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now)),
+        "date": time.strftime("%Y-%m-%d", time.localtime(now)),
+        "trigger": trigger,
+        "ok": all(c["ok"] for c in checks),
+        "checks": checks,
+    }
+
+
+def format_selftest(result: dict) -> str:
+    lines = [f"Self-test {'PASSED' if result['ok'] else 'FAILED'} at {result['time']} "
+             f"({result['trigger']})", ""]
+    for c in result["checks"]:
+        lines.append(f"  [{'OK ' if c['ok'] else 'FAIL'}] {c['name']}: {c['msg']}")
+    return "\n".join(lines)
+
+
+def selftest_notify(cfg: dict, result: dict, prev: dict | None, *, log=None) -> None:
+    """Email on failure (every scheduled run), on recovery, and optionally on success."""
+    st = selftest_cfg(cfg)
+    hostname = socket.gethostname()
+    failed = [c for c in result["checks"] if not c["ok"]]
+    if failed:
+        subject = (f"[nutshutdown] SELF-TEST FAILED: {len(failed)} problem(s), "
+                   f"{', '.join(c['name'] for c in failed)}")
+        intro = ("The daily self-test found problems that could stop a clean "
+                 "shutdown during a power outage. Fix these, then use \"Run "
+                 "self-test now\" in the web UI to confirm.\n\n")
+    elif prev is not None and not prev.get("ok", True):
+        subject = "[nutshutdown] Self-test passing again"
+        intro = "The problems reported by the previous self-test are resolved.\n\n"
+    elif st["email_on_success"]:
+        subject = "[nutshutdown] Self-test OK"
+        intro = ""
+    else:
+        return
+    body = f"{intro}{format_selftest(result)}\n\nOrchestrator: {hostname}\n"
+    ok, msg = send_email(cfg, subject, body)
+    if log:
+        (log.info if ok else log.error)(
+            f"self-test email {'sent' if ok else 'FAILED'}: {subject} ({msg})")
+
+
+def maybe_run_scheduled_selftest(cfg: dict, *, log=None) -> dict | None:
+    """Run the daily self-test if it's due. Called by the cron worker each tick.
+
+    Due = enabled, local hour >= configured hour, and no scheduled run yet
+    today. Skipped (and retried next tick) while an outage is in progress, so
+    it never competes with real shutdown work or sends confusing emails.
+    """
+    st = selftest_cfg(cfg)
+    if not st["enabled"]:
+        return None
+    now = time.localtime()
+    if now.tm_hour < int(st["hour"]):
+        return None
+    prev = load_selftest(cfg)
+    today = time.strftime("%Y-%m-%d", now)
+    if prev and prev.get("last_scheduled_date") == today:
+        return None
+    if read_state(cfg) != NORMAL:
+        return None
+    try:
+        if read_ups(cfg["ups_name"]).get("_on_battery"):
+            return None
+    except Exception:
+        pass  # unreadable UPS is itself a failure the self-test will report
+
+    result = run_selftest(cfg, trigger="scheduled")
+    result["last_scheduled_date"] = today
+    save_selftest(cfg, result)
+    if log:
+        (log.info if result["ok"] else log.error)(
+            "SELF-TEST " + ("passed" if result["ok"] else "FAILED: " + "; ".join(
+                f"{c['name']}: {c['msg']}" for c in result["checks"] if not c["ok"])))
+    selftest_notify(cfg, result, prev, log=log)
+    return result

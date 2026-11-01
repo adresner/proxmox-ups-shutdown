@@ -248,9 +248,41 @@ UI anywhere beyond a trusted LAN.**
 - **Hosts table** — toggle enable/disable, per-row "Test SSH" + "Push key" +
   "Reset host key" + "Remove". Reinstalled a host? Click "Reset host key"
   (or just "Push key", which forgets the old key first). Add-host row with optional one-shot key push.
+- **Self-test** — see below. Header pills show when the cron worker last ran
+  and the last self-test result.
 - **Simulate** — enter a fake charge %, see exactly which action would fire
   and which SSH commands would be issued. Nothing is actually shut down.
 - **Recent log** — tail of `/var/log/power_monitor.log`.
+
+### Self-test and worker watchdog
+
+A shutdown tool that only runs during outages can break silently in between:
+a host gets reinstalled and its SSH key changes, a password-only login sneaks
+back in, the SMTP relay moves, cron stops. The self-test catches that before
+the next outage does.
+
+Once a day (hour configurable in the web UI, default 07:00 server time) the
+cron worker checks, read-only:
+
+| Check | Passes when |
+|---|---|
+| UPS | `upsc` answers, status is `OL`, and the UPS isn't flagging `RB` (replace battery) |
+| Each enabled host | SSH with the key works **and** `qm list` / `pct list` run (the exact tools the shutdown uses) |
+| Email relay | the SMTP server accepts a connection, EHLO and NOOP (no mail is sent) |
+| Cron worker | the worker's heartbeat is less than 10 minutes old |
+
+On failure it emails you, and again every day until it's fixed; it sends one
+"passing again" email when it recovers. Tick "Also email when everything
+passes" for a daily all-clear. "Run self-test now" in the UI (or
+`./manage.py self-test`) runs the same checks on demand without emailing.
+
+The scheduled run waits until any outage is over, and it runs after the
+worker's shutdown decision for that minute, so it can't delay a shutdown.
+
+Because a dead cron worker can't report on itself, the **web app** separately
+watches the worker's heartbeat and emails you if it hasn't run for 10
+minutes (and again when it recovers). Both are switched by the same "Daily
+self-test + worker watchdog" checkbox.
 
 ### CLI parity
 
@@ -269,6 +301,7 @@ Everything the web UI does is also available via `manage.py`:
 | Change thresholds | `./manage.py set-threshold vm 55` / `set-threshold host 15` |
 | Dry-run at fake charge | `./manage.py simulate 45` |
 | Reset state file | `./manage.py reset-state` |
+| Self-test (UPS, SSH + qm/pct, SMTP, worker) | `./manage.py self-test` |
 | Dry-run real worker | `DRY_RUN=1 /opt/nutshutdown/power_monitor.py` |
 
 ### Safety / what won't break things
@@ -317,6 +350,9 @@ Everything the web UI does is also available via `manage.py`:
 | POST   | `/api/host/<ip>/reset-hostkey` | yes | Forget saved host key (after a reinstall); returns current fingerprint |
 | POST   | `/api/thresholds` | yes | `{vm_shutdown_pct, host_shutdown_pct}` |
 | POST   | `/api/state/reset` | yes | Force state → `NORMAL` |
+| GET    | `/api/selftest` | yes | Self-test settings, last result, server clock, worker heartbeat age |
+| POST   | `/api/selftest/config` | yes | `{enabled, hour, email_on_success}` |
+| POST   | `/api/selftest/run` | yes | Run the self-test now (read-only, no email); returns the result |
 
 **Authentication.** The browser uses a session cookie obtained via the
 `/login` form (Flask-signed, HttpOnly, SameSite=Lax, 30-day lifetime). The

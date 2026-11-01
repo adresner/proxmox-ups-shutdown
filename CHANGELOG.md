@@ -4,6 +4,35 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — Daily self-test and worker watchdog
+
+### Added
+
+- **Daily self-test**, run by the cron worker at a configurable hour. Checks
+  the UPS (readable, on mains, no replace-battery flag), every enabled host
+  (key-based SSH works *and* `qm list` / `pct list` run), the SMTP relay
+  (connect + EHLO + NOOP, nothing sent) and the worker heartbeat. Emails on
+  failure (daily until fixed), once on recovery, and optionally on success.
+  Waits until any outage is over and runs after the shutdown decision, so it
+  can't delay a shutdown.
+- **Worker watchdog** in the web app: emails if the cron worker hasn't run for
+  10 minutes, and again when it recovers. A stopped worker means no outage
+  protection at all, and it can't report that itself.
+- **Worker heartbeat**: the worker writes `/var/run/power_monitor.heartbeat`
+  every tick (not under `DRY_RUN`).
+- **Self-test card** in the web UI (results table, "Run self-test now",
+  enable / hour / email-on-success settings, server clock shown so the hour
+  is unambiguous) and header pills for worker age and last self-test result.
+- `./manage.py self-test`, `GET /api/selftest`, `POST /api/selftest/config`,
+  `POST /api/selftest/run`.
+- `selftest` block in `config.json` (defaults: enabled, 07:00, no success
+  email). Results persist in `selftest_last.json` next to `config.json`.
+
+### Fixed
+
+- Footer text no longer says edits prompt for HTTP Basic Auth (the UI has
+  used a login form since 0.2.0).
+
 ## [0.3.2] — Reliable guest shutdown on hosts with many or slow VMs
 
 ### Fixed

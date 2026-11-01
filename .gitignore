@@ -22,3 +22,6 @@ venv/
 .claude.json
 .bash_history
 NOTES.local.md
+
+# Self-test result (runtime state)
+selftest_last.json
