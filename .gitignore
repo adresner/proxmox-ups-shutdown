@@ -25,3 +25,7 @@ NOTES.local.md
 
 # Self-test result (runtime state)
 selftest_last.json
+
+# patch leftovers
+*.orig
+*.rej
