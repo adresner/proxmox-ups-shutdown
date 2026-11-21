@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — Self-test tolerates a single network blip
+
+### Fixed
+
+- **Self-test host check retries before failing.** A connection failure is
+  retried up to 2 more times, 15 s apart (`SELFTEST_SSH_ATTEMPTS`,
+  `SELFTEST_SSH_RETRY_S`). One dropped SSH connect used to send a FAILED
+  email even though the host was fine seconds later. A host that is really
+  unreachable still fails, about 30 s later. A pass that needed a retry says
+  so in the result (`ok on attempt N; first try: ...`).
+
 ## [0.5.0] — Trigger on battery % or runtime, with drain stats
 
 ### Added

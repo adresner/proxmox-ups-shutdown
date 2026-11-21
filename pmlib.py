@@ -901,6 +901,8 @@ def tail_log(cfg: dict, lines: int = 50) -> list[str]:
 SELFTEST_DEFAULTS = {"enabled": True, "hour": 7, "email_on_success": False}
 WORKER_STALE_S = 600   # worker heartbeat older than this = worker not running
 SELFTEST_HOST_CMD = "hostname && qm list >/dev/null && pct list >/dev/null && echo pve-ok"
+SELFTEST_SSH_ATTEMPTS = 3      # host check retries connection failures...
+SELFTEST_SSH_RETRY_S = 15      # ...this many seconds apart
 
 
 def selftest_cfg(cfg: dict) -> dict:
@@ -1012,11 +1014,23 @@ def run_selftest(cfg: dict, *, trigger: str = "manual") -> dict:
         add("Hosts", False, "no hosts are enabled; nothing would be shut down")
 
     def one(h: Host) -> dict:
-        ok, msg = ssh_run(h, cfg, SELFTEST_HOST_CMD)
+        # A single dropped connection (switch/ARP blip) shouldn't page anyone,
+        # so retry connection failures a couple of times before failing. A
+        # host that's really down still fails, ~30s later.
+        first_err = None
+        for attempt in range(SELFTEST_SSH_ATTEMPTS):
+            if attempt:
+                time.sleep(SELFTEST_SSH_RETRY_S)
+            ok, msg = ssh_run(h, cfg, SELFTEST_HOST_CMD)
+            if ok:
+                break
+            first_err = first_err or msg
         if ok and "pve-ok" in msg:
             name = msg.splitlines()[0] if msg else h.label
+            note = (f" (ok on attempt {attempt + 1}; first try: {first_err})"
+                    if attempt else "")
             return {"name": f"Host {h.label}", "ok": True,
-                    "msg": f"{h.ip}: SSH ok (hostname {name}), qm/pct ok"}
+                    "msg": f"{h.ip}: SSH ok (hostname {name}), qm/pct ok{note}"}
         if ok:
             return {"name": f"Host {h.label}", "ok": False,
                     "msg": f"{h.ip}: SSH ok but qm/pct failed: {msg}"}
